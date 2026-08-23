@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import importlib
 import os
@@ -18,16 +18,21 @@ DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
-DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+# patched: hipcc/clang rejects nvcc-only flags; MSVC-style args break on Windows HIP builds
+DEFAULT_CUDA_CFLAGS = (
+    ["-std=c++20", "-O3"]
+    if os.environ.get("HIP_PATH")
+    else ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+)
 DEFAULT_LDFLAGS = []
 
 
 def _cuda_cflags(extra: List[str]) -> List[str]:
     """CUDA nvcc flags for a kernel build. During the multi-arch AOT cache build,
     `TVM_FFI_CUDA_ARCH_LIST` (e.g. "8.6 8.9 9.0 10.0 12.0") makes tvm-ffi emit a SASS cubin
-    (`-gencode ...code=sm_XX`) for each listed arch — but NO PTX. We add the PTX of the HIGHEST
+    (`-gencode ...code=sm_XX`) for each listed arch â€” but NO PTX. We add the PTX of the HIGHEST
     listed arch so a GPU newer than any listed one (no matching SASS) still runs via the driver's
-    PTX→SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
+    PTXâ†’SASS JIT (driver-only, no CUDA toolkit). One top PTX suffices: the loader always
     JIT-forwards from the highest compatible PTX. When the env is unset (runtime JIT), this is a
     no-op and tvm-ffi targets only the local GPU."""
     flags = DEFAULT_CUDA_CFLAGS + extra
@@ -282,3 +287,4 @@ def load_jit(
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
+

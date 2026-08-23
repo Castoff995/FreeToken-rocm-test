@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from typing import Callable, Dict, Generic, TypeVar
+import sys
+
+if sys.platform == 'win32':
+    # patched: zmq.asyncio needs a Selector loop; win32 defaults to Proactor
+    import asyncio as _asyncio
+    _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
 
 import msgpack
 import zmq

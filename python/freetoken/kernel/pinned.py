@@ -17,17 +17,19 @@ import torch
 def _load_pinned_extension():
     try:
         return importlib.import_module("freetoken.kernel._pinned_tensor")
-    except ImportError as exc:
-        raise ImportError(
-            "freetoken.kernel._pinned_tensor is not installed. Reinstall FreeToken "
-            "so the pinned tensor CUDA extension is built at install time."
-        ) from exc
+    except ImportError:
+        # patched: ROCm/Windows fallback -- no exact-size pinned extension;
+        # callers fall back to torch's own pinned allocator (rounds sizes up).
+        return None
 
 
 def create_pinned_tensor_like(input: torch.Tensor) -> torch.Tensor:
     """Create a CPU pinned tensor with the same size, stride, and dtype as input."""
-
-    return _load_pinned_extension().create_pinned_tensor_like(input)
+    ext = _load_pinned_extension()
+    if ext is None:
+        out = torch.empty_like(input, pin_memory=True)
+        return out
+    return ext.create_pinned_tensor_like(input)
 
 
 def copy_to_pinned_tensor(input: torch.Tensor) -> torch.Tensor:
@@ -41,19 +43,26 @@ def copy_to_pinned_tensor(input: torch.Tensor) -> torch.Tensor:
 
 def alloc_pinned_tensor(*shape: int, dtype: torch.dtype) -> torch.Tensor:
     """Allocate an exact-size, uninitialized pinned host tensor via cudaHostAlloc."""
-
-    return _load_pinned_extension().alloc_pinned_tensor(list(shape), dtype)
+    ext = _load_pinned_extension()
+    if ext is None:
+        return torch.empty(*shape, dtype=dtype, pin_memory=True)
+    return ext.alloc_pinned_tensor(list(shape), dtype)
 
 
 def host_register(addr: int, nbytes: int) -> None:
     """cudaHostRegister ``nbytes`` at ``addr`` as portable+mapped (pin-after-fill)."""
-    _load_pinned_extension().host_register(addr, nbytes)
+    ext = _load_pinned_extension()
+    if ext is not None:
+        ext.host_register(addr, nbytes)
 
 
 @lru_cache(maxsize=1)
 def _host_ptr_identity() -> bool:
     # cached per process: FreeToken pins one CUDA device per process (set at engine launch)
-    return bool(_load_pinned_extension().host_ptr_identity())
+    ext = _load_pinned_extension()
+    if ext is None:
+        return False
+    return bool(ext.host_ptr_identity())
 
 
 def device_ptr(t: torch.Tensor) -> int:
@@ -65,4 +74,7 @@ def device_ptr(t: torch.Tensor) -> int:
     ``data_ptr()``. Host tensors must be pinned+mapped."""
     if t.is_cuda or _host_ptr_identity():
         return t.data_ptr()
-    return _load_pinned_extension().host_device_ptr(t.data_ptr())
+    ext = _load_pinned_extension()
+    if ext is None:
+        return t.data_ptr()
+    return ext.host_device_ptr(t.data_ptr())

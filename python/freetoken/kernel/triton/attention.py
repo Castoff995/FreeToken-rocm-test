@@ -395,7 +395,7 @@ def decode_paged_attention(
     # power-of-two tile size for tl.arange. They differ only for non-power-of-two GQA groups
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
     valid_block_h = min(16, group)
-    block_h = triton.next_power_of_2(valid_block_h)
+    block_h = max(16, triton.next_power_of_2(valid_block_h))  # patched: wmma v2 needs M>=16 tiles on RDNA4
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
 

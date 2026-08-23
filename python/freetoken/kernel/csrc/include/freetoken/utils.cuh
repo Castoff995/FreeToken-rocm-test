@@ -5,6 +5,10 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
+#if defined(__HIP_PLATFORM_AMD__)
+#include <freetoken/hip_compat.cuh>
+#endif
+
 #include <concepts>
 #include <cstddef>
 #include <source_location>
@@ -115,6 +119,10 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
+#if defined(__HIP_PLATFORM_AMD__)
+    // patched: ROCm HIP headers lack programmatic-stream-serialization attrs
+    (void)use_pdl;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -123,6 +131,7 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 

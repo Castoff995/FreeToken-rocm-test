@@ -46,22 +46,32 @@ def _pdl_supported() -> bool:
     return is_sm90_supported()
 
 
+# patched: PTX inline asm is NVIDIA-only; constraint 'f' is rejected
+# by the AMDGPU backend.
+_IS_NVIDIA = tl.constexpr(torch.version.cuda is not None)
+
 @triton.jit
 def _fast_tanh(x):
     # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
-    return tl.inline_asm_elementwise(
-        "tanh.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
-    )
+    if _IS_NVIDIA:
+        return tl.inline_asm_elementwise(
+            "tanh.approx.f32 $0, $1;", "=f,f", [x],
+            dtype=tl.float32, is_pure=True, pack=1,
+        )
+    else:
+        return libdevice.tanh(x)
 
 
 @triton.jit
 def _fast_ex2(x):
     # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
-    return tl.inline_asm_elementwise(
-        "ex2.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
-    )
+    if _IS_NVIDIA:
+        return tl.inline_asm_elementwise(
+            "ex2.approx.f32 $0, $1;", "=f,f", [x],
+            dtype=tl.float32, is_pure=True, pack=1,
+        )
+    else:
+        return tl.math.exp2(x)
 
 
 @triton.jit

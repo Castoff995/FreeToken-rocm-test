@@ -1,7 +1,9 @@
 #pragma once
 #include <freetoken/utils.cuh>
 
+#if !defined(_WIN32) && !defined(__HIP_PLATFORM_AMD__)
 #include <sys/cdefs.h>
+#endif
 
 #include <cstddef>
 

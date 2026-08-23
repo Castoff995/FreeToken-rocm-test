@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import os
@@ -10,6 +10,18 @@ from freetoken.distributed import DistributedInfo
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
 
+def _zmq_addr(name: str) -> str:
+    """patched: ipc:// is unsupported on Windows; use localhost TCP there."""
+    import hashlib
+    import os
+    import sys
+
+    if sys.platform == "win32":
+        # patched: name-only hash - all workers must derive the SAME port
+        port = 29876 + int(hashlib.sha1(name.encode()).hexdigest()[:6], 16) % 20000
+        return f"tcp://127.0.0.1:{port}"
+    return f"ipc:///tmp/{name}"
+
 
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
@@ -19,7 +31,7 @@ class ServerArgs(SchedulerConfig):
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
     # The workers read it to leave the shell's foreground process group, so the ^C that cancels
-    # a turn cannot also kill the engine — see server/launch.py:_detach_process_group.
+    # a turn cannot also kill the engine â€” see server/launch.py:_detach_process_group.
     shell_mode: bool = False
     served_model_name: str | None = None
     tool_call_parser: str = "llama3"
@@ -46,13 +58,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_3" + self._unique_suffix
+        return _zmq_addr("freetoken_3")
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
+        result = _zmq_addr("freetoken_4")
         assert result != self.zmq_detokenizer_addr
         return result
 
@@ -684,3 +696,5 @@ def parse_args(
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
+
+

@@ -31,37 +31,18 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     return [str(cuda_home / "include")], library_dirs
 
 
-cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
-_check_toolchain()
+# patched: CUDA-only extensions are optional; skip them when no CUDA toolchain
+# is present (e.g. ROCm builds use torch's own pinned-memory path instead).
+import os
+
+cuda_include_dirs, cuda_library_dirs = [], []
+ext_modules = []
+if os.environ.get("FREETOKEN_SKIP_CUDA_EXT") != "1" and CUDA_HOME is not None:
+    _check_toolchain()
+    cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
 
 
 setup(
-    ext_modules=[
-        CppExtension(
-            name="freetoken.kernel._pinned_tensor",
-            sources=[
-                "python/freetoken/kernel/csrc/pinned_tensor.cpp",
-            ],
-            include_dirs=cuda_include_dirs,
-            library_dirs=cuda_library_dirs,
-            libraries=["cudart"],
-            extra_compile_args=["-O3", "-std=c++17"],
-        ),
-        # CPU-compute MoE executor for --moe-backend cpu. Links cudart for the
-        # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
-        # use per-function target attributes (avx512bf16/avx512f) + a runtime
-        # __builtin_cpu_supports dispatch, so the single binary stays portable
-        # (scalar fallback) -- no global -march is set.
-        CppExtension(
-            name="freetoken.kernel._cpu_moe",
-            sources=[
-                "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
-            ],
-            include_dirs=cuda_include_dirs,
-            library_dirs=cuda_library_dirs,
-            libraries=["cudart"],
-            extra_compile_args=["-O3", "-std=c++17", "-pthread"],
-        ),
-    ],
+    ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )
