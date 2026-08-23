@@ -170,6 +170,37 @@ WMMA-safe `BLOCK_H` padding in the grouped attention kernel, TCP loopback ZMQ
 addresses with deterministic ports, Windows selector event-loop policy,
 graceful CUDA-extension skipping, and a `webui/` one-file chat client.
 
+## Status: Windows 11 + RX 9070 XT (ROCm port work log)
+
+This fork runs natively on Windows 11 against an AMD Radeon RX 9070 XT (gfx1201,
+RDNA4) using TheRock nightly ROCm runtime (`HIP_PATH`, `TVM_FFI_ROCM_ARCH_LIST`,
+`TRITON_OVERRIDE_ARCH=gfx1201`, MSVC vcvars). Measured so far:
+Qwen2.5-3B BF16 ~72 tok/s, Qwen2.5-7B BF16 ~15.8 tok/s, gpt-oss-20b fused-MoE
+~12.2 tok/s (RDNA4 graph-replay MoE crash worked around via eager mode).
+
+Current effort: **packed GGUF loading** for llama.cpp quant types — weights stay
+quantized in VRAM (no bf16 expansion). Approach and state:
+
+- Vendored llama.cpp quant kernels (dequant/GEMV/MMQ/MoE) already cover all
+  classic, K-quant, and IQ types; the bottleneck was Python-side dispatch sets
+  in `layers/gguf.py`, since widened (MMVQ = all kernel-covered types, MMQ =
+  classic+K, chunked-GEMV fallback for IQ at prefill batch sizes).
+- `models/gguf/dense.py` rewritten: header-only type scan, packed `.qweight`
+  emission, per-layer-correct module construction (real Q4_K_M files mix
+  Q4_K/Q6_K per layer), fused groups load as per-slot splits when fully
+  quantized.
+- Full 24-type tables in `models/gguf/dequant.py`, verified against gguf-py
+  `GGML_QUANT_SIZES`; plus MXFP4 and ROCmFPX (types 100–108) dequant support.
+- Adapter hooks wired into llama / qwen2 / mistral / qwen3 families; static
+  validation passes against a real Mistral-7B Q4_K_M checkpoint.
+- Remaining: first GPU end-to-end run of the GGUF path. The vendored kernel is
+  built at runtime by PyTorch's JIT extension builder, whose Windows/HIP
+  toolchain assumptions are the current source of friction (nvcc-only flags,
+  hipcc wrapper arg-mangling); fixes land in `kernel/gguf.py`, with a direct
+  clang or hipRTC-based loader as fallback options.
+- Known RDNA4 issues parked upstream: Triton wave64 cross-lane reduction bug;
+  Triton MXFP4 MoE crash under CUDA-graph replay.
+
 ## Citation
 
 If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
