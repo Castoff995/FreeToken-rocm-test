@@ -13,6 +13,8 @@ TP is assumed to be 1 (the gemma4 GGUF path restricts to TP=1, like the HF path)
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from freetoken.models.gguf.dequant import (
@@ -66,8 +68,36 @@ _DEQUANT = _MMVQ
 _MMVQ_SAFE = 6
 
 
+def _gemm_triton(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
+    """Graph-safe Triton GEMM (vendored from vllm-gguf-plugin, Apache-2.0)."""
+    from freetoken.kernel.triton.gguf_gemm.interface import ggml_mul_mat_a8_triton
+
+    return ggml_mul_mat_a8_triton(qweight, x, qweight_type, qweight.shape[0])
+
+
+def _dequant_triton(rows: torch.Tensor, qweight_type: int, m: int, n: int) -> torch.Tensor:
+    from freetoken.kernel.triton.gguf_dequant.interface import ggml_dequantize_triton
+
+    return ggml_dequantize_triton(rows, qweight_type, m, n)
+
+
+_GGUF_BACKEND = os.environ.get("FT_GGUF_BACKEND")  # "hip" | "triton" | None
+
+
+def _use_triton(x: torch.Tensor) -> bool:
+    """Triton path inside CUDA-graph captures: the HIP extension crashes replay
+    on RDNA4. FT_GGUF_BACKEND forces one globally."""
+    if _GGUF_BACKEND == "triton":
+        return True
+    if _GGUF_BACKEND == "hip":
+        return False
+    return x.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
     """y = x @ dequant(qweight).T, dispatched by batch size and quant type."""
+    if qweight_type not in _UNQUANTIZED and _use_triton(x):
+        return _gemm_triton(x, qweight, qweight_type)
     from freetoken.kernel.gguf import (
         ggml_dequantize,
         ggml_mul_mat_a8,
@@ -170,11 +200,15 @@ class GGUFEmbedding(BaseOP):
         self._embed_scale_t: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.gguf import ggml_dequantize
-
         flat = x.flatten()
         rows = self.qweight.index_select(0, flat)  # [n, row_bytes] packed
-        y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
+        if _use_triton(x):
+            y = _dequant_triton(rows, self._quant_type, flat.shape[0], self.embedding_dim)
+            y = y.to(torch.bfloat16)
+        else:
+            from freetoken.kernel.gguf import ggml_dequantize
+
+            y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
         y = y.view(*x.shape, self.embedding_dim)
         if self._embed_scale is not None:
             if self._embed_scale_t is None:
