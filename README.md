@@ -93,8 +93,8 @@ A ready-made distribution kit lives in [dist/](dist/) and
 \\powershell
 powershell -ExecutionPolicy Bypass -File dist\install.ps1        # deps + patches + freetoken
 powershell -File dist\run-server.ps1 -Model G:\models\my-model   # engine + web UI
-# then open http://localhost:1420  (stop: dist\stop-server.ps1)
-\
+then open http://localhost:1420  (stop: dist\stop-server.ps1)
+
 ### Requirements
 
 - Windows 11, Python 3.12, VS Build Tools (for `vcvarsall.bat` + MSVC CRT link libs)
