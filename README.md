@@ -70,6 +70,18 @@ This fork brings FreeToken up on **Windows 11 + AMD ROCm** with no NVIDIA toolch
 Bring-up target: RX 9070 XT (`gfx1201`). Everything below was verified live: model load,
 prefill, decode (~57 tok/s bf16 3B), SSE token streaming, and the bundled mini web UI.
 
+### Measured performance (RX 9070 XT, Windows, stock settings)
+
+| Model | Precision | Fit | Decode speed | Notes |
+|---|---|---|---|---|
+| Qwen2.5-3B-Instruct | BF16 | full VRAM | **~72 tok/s** | stable, coherent output; SSE first-token ~0.4 s |
+| Qwen2.5-7B-Instruct | BF16 | `--num-pages 4096` (tiny KV) | **~16 tok/s** | weights leave only ~1.5 GB headroom |
+| gpt-oss-20b (MoE) | MXFP4 experts | expert offload engaged | blocked | MoE GEMV kernel fails `hipModuleLoad` on RDNA4 - open issue |
+
+Decode is memory-bandwidth-bound: BF16 3B moves ~6 GB/token against ~640 GB/s,
+so ~72 tok/s is near ceiling for this precision on one card. Quantized GGUF
+support (planned adapters) is the main lever for large-model speed.
+
 ### Quick install (automated)
 
 A ready-made distribution kit lives in [dist/](dist/) and

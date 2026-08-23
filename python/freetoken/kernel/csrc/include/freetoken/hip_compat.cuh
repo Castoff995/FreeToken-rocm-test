@@ -29,6 +29,29 @@ inline constexpr auto cudaFuncAttributeMaxDynamicSharedMemorySize =
 
 inline auto cudaGetLastError() -> ::cudaError_t { return ::hipGetLastError(); }
 
+// ---- device/host-pointer APIs used by fast_index_copy.cuh ----
+inline constexpr auto cudaDevAttrUnifiedAddressing =
+    ::hipDeviceAttributeUnifiedAddressing;
+inline constexpr auto cudaDevAttrCanUseHostPointerForRegisteredMem =
+    ::hipDeviceAttributeCanUseHostPointerForRegisteredMem;
+
+template <typename... A>
+inline auto cudaGetDevice(A &&...args) -> ::cudaError_t {
+  return ::hipGetDevice(args...);
+}
+template <typename... A>
+inline auto cudaDeviceGetAttribute(A &&...args) -> ::cudaError_t {
+  return ::hipDeviceGetAttribute(args...);
+}
+template <typename... A>
+inline auto cudaSetDevice(A &&...args) -> ::cudaError_t {
+  return ::hipSetDevice(args...);
+}
+template <typename... A>
+inline auto cudaHostGetDevicePointer(A &&...args) -> ::cudaError_t {
+  return ::hipHostGetDevicePointer(args...);
+}
+
 template <typename F>
 inline auto cudaFuncSetAttribute(F *func, ::hipFuncAttribute attr, int value)
     -> ::cudaError_t {
