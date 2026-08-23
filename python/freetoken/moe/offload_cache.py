@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -13,6 +14,9 @@ from flashlib.kernels.slot_cache import N_STATS, Stat
 # (kept for A/B profiling). Falls back to per-bank automatically if a bank's row bytes or
 # base address are not 16-byte aligned.
 _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0", "false", "no", "off"}
+# Force/debug override only. Unmapped Windows ROCm banks select this path automatically.
+SAFE_OFFLOAD_COPY_ENV = "FREETOKEN_ROCM_SAFE_OFFLOAD_COPY"
+_ENV_TRUE = {"1", "true", "yes", "on"}
 
 # cudaMemcpyBatchAsync silently degrades to a SYNCHRONOUS copy when a batch mixes
 # large entries with sub-~256KB entries on registered host memory (H100 + CUDA 13.0,
@@ -226,6 +230,9 @@ class OffloadMoeCache:
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
         self.banks: list[tuple[list[torch.Tensor], torch.Tensor]] = []
+        # Lazily proven per-layer host-device mapping capability. Host sources are fixed
+        # after registration, so repeated decode steps need not call the HIP mapping API.
+        self._host_mapping_safe: list[bool | None] = [None] * self.num_layers
         # Fused multi-bank copy descriptor (built by set_bank_sources/_build_copy_plan).
         # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
         # tensor); dst/feat are layer-invariant.
@@ -311,6 +318,7 @@ class OffloadMoeCache:
                 device=self.device,
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        self._host_mapping_safe = [None] * self.num_layers
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
@@ -840,6 +848,95 @@ class OffloadMoeCache:
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
 
+    def should_use_safe_offload_copy(self, layer_id: int) -> bool:
+        """Select staged H2D when Windows ROCm cannot safely dereference host banks."""
+
+        if sys.platform != "win32" or not getattr(torch.version, "hip", None):
+            return False
+        if os.getenv(SAFE_OFFLOAD_COPY_ENV, "").strip().lower() in _ENV_TRUE:
+            return True
+
+        from freetoken.moe.decode_trace import inspect_host_mapping
+
+        # Windows/WDDM can map registered host memory at a device address different
+        # from its CPU virtual address. A "pinned" residency label is insufficient:
+        # without a working host_device_ptr translation, fast_index_copy would hand the
+        # GPU an unregistered CPU VA and can trigger a driver TDR. Fail over to ordinary
+        # PyTorch H2D copies unless every current bank has a demonstrated HIP mapping.
+        mapping_safe = self._host_mapping_safe[layer_id]
+        if mapping_safe is None:
+            mapping_safe = inspect_host_mapping(self, layer_id).safe_for_gpu_deref
+            self._host_mapping_safe[layer_id] = mapping_safe
+        return not mapping_safe
+
+    def _safe_copy_plan(self) -> tuple[tuple[int, int], ...]:
+        """Snapshot the staged LRU destinations/source rows into a host copy plan."""
+
+        count = int(self.num_indices.item())
+        if count < 0 or count > self.num_experts:
+            raise ValueError(
+                f"invalid safe-copy row count {count}; expected 0..{self.num_experts}"
+            )
+        destinations = self.evict_slots[:count].detach().to("cpu").tolist()
+        sources = self.src_indices[:count].detach().to("cpu").tolist()
+        plan = tuple((int(dst), int(src)) for dst, src in zip(destinations, sources))
+        for destination, source in plan:
+            if destination < 0 or destination >= self.cache_size:
+                raise ValueError(
+                    f"safe-copy destination slot {destination} outside cache size {self.cache_size}"
+                )
+            if source < 0 or source >= self.num_experts:
+                raise ValueError(
+                    f"safe-copy source expert {source} outside expert count {self.num_experts}"
+                )
+        if len({destination for destination, _ in plan}) != len(plan):
+            raise ValueError("safe-copy plan contains duplicate destination slots")
+        return plan
+
+    def _copy_missing_safe(self, layer_id: int) -> None:
+        """Copy staged miss rows through ordinary synchronous PyTorch H2D copies."""
+
+        from freetoken.moe import decode_trace
+
+        plan = self._safe_copy_plan()
+        tracing = decode_trace.trace_active()
+        if tracing:
+            decode_trace.trace_stage(
+                "safe_copy_start",
+                layer=layer_id,
+                bank_count=len(self.banks),
+                missing_row_count=len(plan),
+            )
+        for bank_index, (name, (per_layer, cache)) in enumerate(
+            zip(self.bank_schema, self.banks)
+        ):
+            if tracing:
+                decode_trace.trace_stage(
+                    "safe_copy_bank_start",
+                    layer=layer_id,
+                    bank=name,
+                    bank_index=bank_index,
+                    missing_row_count=len(plan),
+                )
+            source = per_layer[layer_id]
+            for destination, source_index in plan:
+                cache[destination].copy_(source[source_index], non_blocking=False)
+            if tracing:
+                decode_trace.trace_stage(
+                    "safe_copy_bank_complete",
+                    layer=layer_id,
+                    bank=name,
+                    bank_index=bank_index,
+                    copied_row_count=len(plan),
+                )
+        if tracing:
+            decode_trace.synchronize(
+                "safe_copy",
+                self.device,
+                layer=layer_id,
+                copied_row_count=len(plan),
+            )
+
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
             active = int(self.stat_active.item())
@@ -927,6 +1024,9 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self.should_use_safe_offload_copy(layer_id):
+            self._copy_missing_safe(layer_id)
+            return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
