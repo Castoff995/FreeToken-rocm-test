@@ -68,64 +68,75 @@ For More details:
 
 This fork brings FreeToken up on **Windows 11 + AMD ROCm** with no NVIDIA toolchain.
 Bring-up target: RX 9070 XT (`gfx1201`). Everything below was verified live: model load,
-prefill, decode (~57 tok/s bf16 3B), SSE streaming, and the bundled mini web UI.
-
-### What works today
-
-| Area | Status |
-|---|---|
-| Dense HF safetensors models (bf16/fp16), single GPU | ✅ working (Qwen2.5-3B verified; 7B fits only with `--num-pages` cap) |
-| OpenAI-compatible `/v1/chat/completions`, streaming | ✅ working |
-| Triton attention/norm/activation kernels on RDNA4 | ✅ working (AMD backend) |
-| tvm-ffi JIT CUDA kernels (`index`, `store`, `radix`) | ✅ compiling via `hipcc` + host `clang++` |
-| Web chat UI | ✅ `G:\FreeToken\webui\index.html` (serve on port 1420) |
-| CUDA extensions skipped gracefully | ✅ `FREETOKEN_SKIP_CUDA_EXT=1` |
-| Pinned-memory / ZMQ IPC fallbacks on Windows | ✅ TCP loopback + torch pin_memory |
-| MoE expert offload (split CPU–GPU execution) | ⚠️ untested on Windows yet |
-| GGUF loader | ⚠️ `gemma4` architecture only — Qwen/Laguna/DeepSeek adapters pending |
-| ROCmFPX-quantized GGUFs | ❌ proprietary quant types, needs the source fork |
+prefill, decode (~57 tok/s bf16 3B), SSE token streaming, and the bundled mini web UI.
 
 ### Quick install (automated)
 
 A ready-made distribution kit lives in [dist/](dist/) and
 [PORT_REQUIREMENTS.md](PORT_REQUIREMENTS.md):
 
-\\powershell
-powershell -ExecutionPolicy Bypass -File dist\install.ps1        # deps + patches + freetoken
-powershell -File dist\run-server.ps1 -Model G:\models\my-model   # engine + web UI
-then open http://localhost:1420  (stop: dist\stop-server.ps1)
+```powershell
+# once: clone + install deps, patches and freetoken
+git clone https://github.com/Maxritz/FreeToken-rocm-test.git
+cd FreeToken-rocm-test
+powershell -ExecutionPolicy Bypass -File dist/install.ps1
+
+# every session: engine + web UI
+powershell -File dist/run-server.ps1 -Model <path-to-model>
+# then open http://localhost:1420   (stop: dist/stop-server.ps1)
+```
+
+A fully portable bundle (embeddable Python + wheels, no clone needed) can be built with
+`dist/make-bundle.ps1`; users then run its bundled `install.ps1` instead.
+
+### What works today
+
+| Area | Status |
+|---|---|
+| Dense HF safetensors models (bf16/fp16), single GPU | working (Qwen2.5-3B verified; 7B fits only with `--num-pages` cap) |
+| OpenAI-compatible `/v1/chat/completions`, SSE streaming | working |
+| Triton attention/norm/activation kernels on RDNA4 | working (AMD backend) |
+| tvm-ffi JIT CUDA kernels (`index`, `store`, `radix`) | compiling via `hipcc` + host `clang++` |
+| Web chat UI | `<repo>/webui/index.html`, served on port 1420 |
+| CUDA extensions skipped gracefully | `FREETOKEN_SKIP_CUDA_EXT=1` |
+| Pinned-memory / ZMQ IPC fallbacks on Windows | TCP loopback + torch pin_memory |
+| MoE expert offload (split CPU-GPU execution) | untested on Windows yet |
+| GGUF loader | `gemma4` architecture only - Qwen/Laguna/DeepSeek adapters pending |
+| ROCmFPX-quantized GGUFs | proprietary quant types, needs the source fork |
 
 ### Requirements
 
 - Windows 11, Python 3.12, VS Build Tools (for `vcvarsall.bat` + MSVC CRT link libs)
-- AMD ROCm runtime - **TheRock nightly** (`10.1.0a20260817`, HIP 7.16) until ROCm 10.1 ships formally; e.g. `HIP_PATH=G:\ROCM10RT-gfx1201`
-- Pip stack (matching TheRock nightly `10.1.0a20260817`):
-  - `torch 2.15.0a0+rocm10.1.0a20260816` + `amd_torch_device_gfx1201` (install with `--no-deps`)
-  - `triton-windows >= 3.7.1.post27` (ships the `amd` backend)
-  - `apache-tvm-ffi == 0.1.13.post3`
+- AMD ROCm runtime - **TheRock nightly** (`10.1.0a20260817`, HIP 7.16) until ROCm 10.1
+  ships formally; set `HIP_PATH=<your-rocm-root>`
+- Wheels fetched from https://rocm.nightlies.amd.com/whl-multi-arch/
+- Pip stack: torch `2.15.0a0+rocm10.1.0a20260816` + `amd-torch-device-gfx1201`
+  (install with `--no-deps`), `triton-windows >= 3.7.1.post27`,
+  `apache-tvm-ffi == 0.1.13.post3`
 - Install FreeToken itself without CUDA extensions:
 
 ```powershell
 $env:FREETOKEN_SKIP_CUDA_EXT = "1"
-pip install -e G:\FreeToken --no-deps --no-build-isolation
+pip install -e <path-to-this-repo> --no-deps --no-build-isolation
 ```
 
 ### Environment switches
 
-| Switch | Value | Purpose |
+| Switch | Example value | Purpose |
 |---|---|---|
-| `HIP_PATH` | `G:\ROCM10RT-gfx1201` | locates `hipcc`, HIP libs for JIT builds & linking |
+| `HIP_PATH` | `<rocm-root>` | locates `hipcc`, HIP libs for JIT builds and linking |
 | `TRITON_OVERRIDE_ARCH` | `gfx1201` | forces Triton codegen target |
-| `TVM_FFI_ROCM_ARCH_LIST` | `gfx1201` | tvm-ffi emits `--offload-arch=gfx1201` (else gfx906 default → broken kernels) |
-| `CC` | `<ROCM>\lib\llvm\bin\clang.EXE` | host compiler for JIT extensions |
+| `TVM_FFI_ROCM_ARCH_LIST` | `gfx1201` | tvm-ffi emits `--offload-arch=<arch>` (else gfx906 default -> broken kernels) |
+| `ROCM_SDK_TARGET_FAMILY` | `gfx1201` | device family for the rocm-sdk wheel runtime (nightly-only) |
+| `CC` | `<rocm-root>\lib\llvm\bin\clang.EXE` | host compiler for JIT extensions |
 | `FREETOKEN_SKIP_CUDA_EXT` | `1` | build-time: install without nvcc/CUDA extensions |
 | `--num-pages N` | e.g. `4096` | caps KV cache pages so large dense models fit in VRAM |
 
-Launch recipe (see `run_serve.cmd` pattern):
+Launch recipe (what `dist/run-server.ps1` does):
 
 ```bat
-call "...\VC\Auxiliary\Build\vcvarsall.bat" x64
-set HIP_PATH=G:\ROCM10RT-gfx1201
+call "<vs>\VC\Auxiliary\Build\vcvarsall.bat" x64
+set HIP_PATH=<rocm-root>
 set TVM_FFI_ROCM_ARCH_LIST=gfx1201
 set TRITON_OVERRIDE_ARCH=gfx1201
 ft serve --model <model_path>
@@ -135,16 +146,16 @@ ft serve --model <model_path>
 
 ### Site-packages patches this fork relies on
 
-Three upstream packages need small patches until merged upstream (all documented in
-[DIAGNOSTICS.md](DIAGNOSTICS.md)):
+Three upstream packages need small patches until merged upstream - applied automatically
+by `dist/patch_upstream.py`, documented in [DIAGNOSTICS.md](DIAGNOSTICS.md):
 
-1. **tvm_ffi/cpp/extension.py** — on Windows+HIP: use `hipcc` flags (no `-fPIC`,
+1. **tvm_ffi/cpp/extension.py** - on Windows+HIP: use `hipcc` flags (no `-fPIC`,
    no MSVC-style `-Xcompiler` args), emit `--offload-arch`, link `amdhip64.lib`,
    and build *host* C++ with HIP `clang++` instead of `cl.exe` (MSVC rejects the
    `RuntimeCheck` pack+default-arg idiom).
-2. **triton/backends/amd/compiler.py** — add `launch_pdl: bool = False` to
+2. **triton/backends/amd/compiler.py** - add `launch_pdl: bool = False` to
    `HIPOptions` so NVIDIA-only launch kwargs are accepted-and-ignored.
-3. **uvicorn/loops/asyncio.py** — return `SelectorEventLoop` (not `ProactorEventLoop`)
+3. **uvicorn/loops/asyncio.py** - return `SelectorEventLoop` (not `ProactorEventLoop`)
    on win32; `zmq.asyncio` requires `add_reader`.
 
 Engine-side patches included in this fork: HIP compat shim for CUDA-flavored kernel
