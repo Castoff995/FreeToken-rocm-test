@@ -51,23 +51,58 @@ def _c_compiler_for(cxx: str) -> str:
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
-    host_cxx = _host_compiler()
-    if host_cxx is not None:
-        # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
-        # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
-        # default (CXX unset -> g++) can be a gcc too new for the torch headers.
-        cxx_path = shutil.which(host_cxx) or host_cxx
-        extra_cuda_cflags += ["-ccbin", cxx_path]
-        os.environ["CXX"] = cxx_path
-        os.environ["CC"] = _c_compiler_for(cxx_path)
+    is_hip = getattr(torch.version, "hip", None) is not None
+    # --expt-relaxed-constexpr / -ccbin are nvcc-only; HIP's clang++ rejects them.
+    extra_cuda_cflags = ["-O3"] + ([] if is_hip else ["--expt-relaxed-constexpr"])
+    if not is_hip:
+        host_cxx = _host_compiler()
+        if host_cxx is not None:
+            # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
+            # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
+            # default (CXX unset -> g++) can be a gcc too new for the torch headers.
+            cxx_path = shutil.which(host_cxx) or host_cxx
+            extra_cuda_cflags += ["-ccbin", cxx_path]
+            os.environ["CXX"] = cxx_path
+            os.environ["CC"] = _c_compiler_for(cxx_path)
+    elif os.environ.get("PYTORCH_NVCC") is None:
+        # HIP toolchain: prefer TheRock's clang so JIT builds match the engine build.
+        llvm_bin = pathlib.Path(os.environ.get("HIP_PATH", "")) / "lib" / "llvm" / "bin"
+        if llvm_bin.is_dir():
+            os.environ["CC"] = os.environ.get("CC", str(llvm_bin / "clang.EXE"))
+            os.environ["CXX"] = os.environ.get("CXX", str(llvm_bin / "clang++.EXE"))
+            # Bypass the hipcc.exe wrapper entirely: it re-quotes arguments and
+            # breaks on any path containing spaces ("-IC:\Program Files\...").
+            # torch honors PYTORCH_NVCC verbatim; clang needs -x hip spelled out
+            # (hipcc normally injects it).
+            clang = llvm_bin / "clang.EXE"
+            if clang.is_file():
+                os.environ["PYTORCH_NVCC"] = str(clang)
+                extra_cuda_cflags += ["-x", "hip"]
+        # Shorten every sysconfig include dir (8.3 names) so nothing has spaces.
+        import ctypes
+        import sysconfig
+
+        def _short(p):
+            if p is None or " " not in p:
+                return p
+            buf = ctypes.create_unicode_buffer(1024)
+            if ctypes.windll.kernel32.GetShortPathNameW(p, buf, 1024):
+                return buf.value
+            return p
+
+        _orig_get_path = sysconfig.get_path
+
+        def _patched_get_path(name, *a, **k):
+            return _short(_orig_get_path(name, *a, **k))
+
+        sysconfig.get_path = _patched_get_path
 
     # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
     # plain `load` of the single source compiles + binds the ggml_* ops.
     return load(
         name="freetoken_gguf_kernels",
         sources=[str(_CSRC / "gguf_kernel.cu")],
-        extra_include_paths=[str(_CSRC)],
+        extra_include_paths=[str(_CSRC / "jit_shim"), str(_CSRC)],
         extra_cuda_cflags=extra_cuda_cflags,
         verbose=True,
     )

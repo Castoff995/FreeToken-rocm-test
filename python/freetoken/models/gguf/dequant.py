@@ -18,12 +18,28 @@ from __future__ import annotations
 
 import torch
 
-# ggml_type enum values (subset present in these checkpoints).
+# ggml_type enum values.
 GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
+GGML_Q4_1 = 3
+GGML_Q5_0 = 6
+GGML_Q5_1 = 7
 GGML_Q8_0 = 8
+GGML_Q2_K = 10
+GGML_Q3_K = 11
+GGML_Q4_K = 12
+GGML_Q5_K = 13
 GGML_Q6_K = 14
+GGML_IQ2_XXS = 16
+GGML_IQ2_XS = 17
+GGML_IQ3_XXS = 18
+GGML_IQ1_S = 19
+GGML_IQ4_NL = 20
+GGML_IQ3_S = 21
+GGML_IQ2_S = 22
+GGML_IQ4_XS = 23
+GGML_IQ1_M = 29
 GGML_BF16 = 30
 GGML_MXFP4 = 39
 GGML_Q4_0_ROCMFP4 = 100
@@ -36,8 +52,24 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_F16: (1, 2),
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
+    GGML_Q4_1: (32, 20),
+    GGML_Q5_0: (32, 22),
+    GGML_Q5_1: (32, 24),
     GGML_Q8_0: (32, 34),
+    GGML_Q2_K: (256, 84),
+    GGML_Q3_K: (256, 110),
+    GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
+    GGML_IQ2_XXS: (256, 66),
+    GGML_IQ2_XS: (256, 74),
+    GGML_IQ3_XXS: (256, 98),
+    GGML_IQ1_S: (256, 50),
+    GGML_IQ4_NL: (32, 18),
+    GGML_IQ3_S: (256, 110),
+    GGML_IQ2_S: (256, 82),
+    GGML_IQ4_XS: (256, 136),
+    GGML_IQ1_M: (256, 56),
     # OCP MXFP4: E8M0 scale byte + 16 packed nibbles (llama.cpp block_mxfp4)
     GGML_MXFP4: (32, 17),
     # ROCmFPX family (charlie12345/ROCmFPX): 16 packed nibbles + UE4M3 scale(s)
@@ -51,8 +83,24 @@ GGML_NAME = {
     GGML_F16: "F16",
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
+    GGML_Q4_1: "Q4_1",
+    GGML_Q5_0: "Q5_0",
+    GGML_Q5_1: "Q5_1",
     GGML_Q8_0: "Q8_0",
+    GGML_Q2_K: "Q2_K",
+    GGML_Q3_K: "Q3_K",
+    GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ2_XXS: "IQ2_XXS",
+    GGML_IQ2_XS: "IQ2_XS",
+    GGML_IQ3_XXS: "IQ3_XXS",
+    GGML_IQ1_S: "IQ1_S",
+    GGML_IQ4_NL: "IQ4_NL",
+    GGML_IQ3_S: "IQ3_S",
+    GGML_IQ2_S: "IQ2_S",
+    GGML_IQ4_XS: "IQ4_XS",
+    GGML_IQ1_M: "IQ1_M",
     GGML_MXFP4: "MXFP4",
     GGML_Q4_0_ROCMFP4: "Q4_0_ROCMFP4",
     GGML_Q4_0_ROCMFP4_FAST: "Q4_0_ROCMFP4_FAST",

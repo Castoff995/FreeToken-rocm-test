@@ -76,6 +76,11 @@ class MistralForCausalLM(BaseLLMModel):
         )
         super().__init__()
 
+        # Packed-GGUF loads swap dense projections for native quant ops.
+        from freetoken.models.gguf.dense import maybe_convert_dense_to_gguf
+
+        maybe_convert_dense_to_gguf(self, config)
+
     def forward(self) -> torch.Tensor:
         ids = get_global_ctx().batch.input_ids
         output = self.model.forward(ids)

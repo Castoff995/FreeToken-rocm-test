@@ -76,6 +76,11 @@ class LlamaForCausalLM(BaseLLMModel):
         )
         super().__init__()
 
+        # Packed-GGUF loads swap dense projections for native quant ops.
+        from freetoken.models.gguf.dense import maybe_convert_dense_to_gguf
+
+        maybe_convert_dense_to_gguf(self, config)
+
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         logits = self.lm_head.forward(output)

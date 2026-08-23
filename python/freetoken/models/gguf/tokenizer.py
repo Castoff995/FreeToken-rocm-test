@@ -32,6 +32,25 @@ def load_gguf_tokenizer(model_path: str):
 
     tokens = tok_dict["tokens"]
 
+    # The converted rust tokenizer has no BOS post-processor, so encode(...,
+    # add_special_tokens=True) silently drops the BOS that GGUF's
+    # add_bos_token promises — fatal for BOS-sensitive models (llama-2 family
+    # emits pure noise without it). Chat templates render their own <s> and are
+    # encoded with add_special_tokens=False, where the vocab lookup maps the
+    # literal token anyway, so this never double-fires.
+    bos_id = meta.get("tokenizer.ggml.bos_token_id")
+    if tok_dict.get("add_bos_token") and bos_id is not None:
+        from tokenizers.processors import TemplateProcessing
+
+        bos_str = tokens[int(bos_id)]
+        if isinstance(bos_str, bytes):
+            bos_str = bos_str.decode("utf-8", errors="replace")
+        fast.post_processor = TemplateProcessing(
+            single=f"{bos_str} $A",
+            pair=f"{bos_str} $A $B",
+            special_tokens=[(bos_str, int(bos_id))],
+        )
+
     def tok_for(id_key: str, default: str) -> str:
         tid = meta.get(f"tokenizer.ggml.{id_key}")
         return tokens[int(tid)] if tid is not None and int(tid) < len(tokens) else default
