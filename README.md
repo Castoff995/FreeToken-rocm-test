@@ -89,21 +89,6 @@ powershell -File dist/run-server.ps1 -Model <path-to-model>
 A fully portable bundle (embeddable Python + wheels, no clone needed) can be built with
 `dist/make-bundle.ps1`; users then run its bundled `install.ps1` instead.
 
-### What works today
-
-| Area | Status |
-|---|---|
-| Dense HF safetensors models (bf16/fp16), single GPU | working (Qwen2.5-3B verified; 7B fits only with `--num-pages` cap) |
-| OpenAI-compatible `/v1/chat/completions`, SSE streaming | working |
-| Triton attention/norm/activation kernels on RDNA4 | working (AMD backend) |
-| tvm-ffi JIT CUDA kernels (`index`, `store`, `radix`) | compiling via `hipcc` + host `clang++` |
-| Web chat UI | `<repo>/webui/index.html`, served on port 1420 |
-| CUDA extensions skipped gracefully | `FREETOKEN_SKIP_CUDA_EXT=1` |
-| Pinned-memory / ZMQ IPC fallbacks on Windows | TCP loopback + torch pin_memory |
-| MoE expert offload (split CPU-GPU execution) | untested on Windows yet |
-| GGUF loader | `gemma4` architecture only - Qwen/Laguna/DeepSeek adapters pending |
-| ROCmFPX-quantized GGUFs | proprietary quant types, needs the source fork |
-
 ### Requirements
 
 - Windows 11, Python 3.12, VS Build Tools (for `vcvarsall.bat` + MSVC CRT link libs)
