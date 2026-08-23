@@ -107,6 +107,32 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # Classic dense GGUF families: shared dense adapter in models/gguf/dense.py,
+    # per-family wrappers reuse each package's own parse_config.
+    "LlamaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.llama",
+        "LlamaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    "Qwen2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen2",
+        "Qwen2ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    "MistralGGUFForCausalLM": ModelSpec(
+        "freetoken.models.mistral",
+        "MistralForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    "Qwen3GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3",
+        "Qwen3ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",

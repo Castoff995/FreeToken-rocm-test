@@ -25,6 +25,10 @@ GGML_Q4_0 = 2
 GGML_Q8_0 = 8
 GGML_Q6_K = 14
 GGML_BF16 = 30
+GGML_MXFP4 = 39
+GGML_Q4_0_ROCMFP4 = 100
+GGML_Q4_0_ROCMFP4_FAST = 101
+GGML_Q4_0_ROCMI4 = 108
 
 # (block numel, bytes per block) per ggml type.
 BLOCK_SHAPE: dict[int, tuple[int, int]] = {
@@ -34,6 +38,12 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
     GGML_Q6_K: (256, 210),
+    # OCP MXFP4: E8M0 scale byte + 16 packed nibbles (llama.cpp block_mxfp4)
+    GGML_MXFP4: (32, 17),
+    # ROCmFPX family (charlie12345/ROCmFPX): 16 packed nibbles + UE4M3 scale(s)
+    GGML_Q4_0_ROCMFP4: (32, 18),
+    GGML_Q4_0_ROCMFP4_FAST: (32, 17),
+    GGML_Q4_0_ROCMI4: (32, 17),
 }
 
 GGML_NAME = {
@@ -43,6 +53,10 @@ GGML_NAME = {
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
     GGML_Q6_K: "Q6_K",
+    GGML_MXFP4: "MXFP4",
+    GGML_Q4_0_ROCMFP4: "Q4_0_ROCMFP4",
+    GGML_Q4_0_ROCMFP4_FAST: "Q4_0_ROCMFP4_FAST",
+    GGML_Q4_0_ROCMI4: "Q4_0_ROCMI4",
 }
 
 
@@ -115,9 +129,108 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+# --------------------------------------------------------------------------------------
+# MXFP4 (ggml type 39) and the ROCmFPX family (types 100/101/108, from
+# charlie12345/ROCmFPX). All are 32-element blocks of packed nibbles with an
+# 8-bit exponent scale; they differ only in codebook + scale encoding.
+# --------------------------------------------------------------------------------------
+
+# E2M1-derived codebooks: index = low 3 bits, sign = bit 3.
+_KV_MXFP4 = [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]
+_KV_ROCMFP4 = [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0]
+
+
+_MXFP4_LUT = torch.tensor(
+    [_KV_MXFP4[i] if i < 8 else -_KV_MXFP4[i - 8] for i in range(16)], dtype=torch.float32
+)
+_ROCMFP4_LUT = torch.tensor(
+    [_KV_ROCMFP4[i] if i < 8 else -_KV_ROCMFP4[i - 8] for i in range(16)], dtype=torch.float32,
+)
+
+
+def _ue4m3_half_table() -> torch.Tensor:
+    """127-entry UE4M3-half scale table from rocmfp4.c: byte b = e_field*8+m;
+    e_field==0 -> subnormal m*2^-10; else (8+m)*2^(e_field-11). Byte >= 0x7f -> 0."""
+    t = torch.empty(128, dtype=torch.float32)
+    for b in range(127):
+        e_field, m = divmod(b, 8)
+        t[b] = m * 2.0**-10 if e_field == 0 else (8 + m) * 2.0 ** (e_field - 11)
+    t[127] = 0.0
+    return t
+
+
+_UE4M3_HALF = _ue4m3_half_table()
+
+
+def _nibble_blocks(raw: torch.Tensor, scale_cols: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split [N, 17|18] block rows into codes [N,32] and per-half scales [N,2]."""
+    qs = raw[:, :16]
+    scales = raw[:, scale_cols].to(torch.int64)
+    lo = (qs & 0x0F).to(torch.int64)
+    hi = (qs >> 4).to(torch.int64)
+    codes = torch.stack([lo, hi], dim=2)  # [N, 16, 2]
+    return codes, scales
+
+
+def dequant_mxfp4(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """block_mxfp4 { uint8 e(E8M0); uint8 qs[16]; } -> d = 2^(e-127)."""
+    n = raw.shape[0]
+    e = raw[:, 0].to(torch.int64)
+    qs = raw[:, 1:]
+    lo = (qs & 0x0F).to(torch.int64)
+    hi = (qs >> 4).to(torch.int64)
+    d = torch.pow(2.0, (e - 127).to(torch.float32))  # E8M0 half-bias
+    out = raw.new_empty((n, 32), dtype=torch.float32)
+    out[:, :16] = _MXFP4_LUT[lo] * d[:, None]
+    out[:, 16:] = _MXFP4_LUT[hi] * d[:, None]
+    return out.to(out_dtype).reshape(-1)
+
+
+def dequant_q4_0_rocmfp4(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_0_ROCMFP4 { qs[16]; e[2](UE4M3-half per 16-weight half block); }"""
+    n = raw.shape[0]
+    codes, scales = _nibble_blocks(raw, [16, 17])
+    s = _UE4M3_HALF[scales]  # [N, 2]
+    out = raw.new_empty((n, 32), dtype=torch.float32)
+    out[:, :16] = _ROCMFP4_LUT[codes[:, :, 0]] * s[:, 0:1]
+    out[:, 16:] = _ROCMFP4_LUT[codes[:, :, 1]] * s[:, 1:2]
+    return out.to(out_dtype).reshape(-1)
+
+
+def dequant_q4_0_rocmfp4_fast(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_0_ROCMFP4_FAST { qs[16]; e(UE4M3-half for the whole 32-block); }"""
+    n = raw.shape[0]
+    codes, scales = _nibble_blocks(raw, [16])
+    s = _UE4M3_HALF[scales[:, 0]]  # [N]
+    out = raw.new_empty((n, 32), dtype=torch.float32)
+    out[:, :16] = _ROCMFP4_LUT[codes[:, :, 0]] * s[:, None]
+    out[:, 16:] = _ROCMFP4_LUT[codes[:, :, 1]] * s[:, None]
+    return out.to(out_dtype).reshape(-1)
+
+
+def dequant_q4_0_rocmi4(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q4_0_ROCMI4 { int8 qs as two's-complement nibbles; e(UE4M3-half); }"""
+    n = raw.shape[0]
+    qs = raw[:, :16].to(torch.int64)
+    lo = (qs & 0x0F)
+    hi = (qs >> 4)
+    lo = torch.where(lo >= 8, lo - 16, lo).to(torch.float32)
+    hi = torch.where(hi >= 8, hi - 16, hi).to(torch.float32)
+    s = _UE4M3_HALF[raw[:, 16].to(torch.int64)]  # [N]
+    out = raw.new_empty((n, 32), dtype=torch.float32)
+    out[:, :16] = lo * s[:, None]
+    out[:, 16:] = hi * s[:, None]
+    return out.to(out_dtype).reshape(-1)
+
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
     GGML_Q6_K: dequant_q6_k,
+    GGML_MXFP4: dequant_mxfp4,
+    GGML_Q4_0_ROCMFP4: dequant_q4_0_rocmfp4,
+    GGML_Q4_0_ROCMFP4_FAST: dequant_q4_0_rocmfp4_fast,
+    GGML_Q4_0_ROCMI4: dequant_q4_0_rocmi4,
 }
 
 
@@ -151,3 +264,29 @@ __all__ = [
     "dequant_q6_k",
     "dequantize",
 ]
+
+
+def dequant_any(t, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """Dequantize any GgufTensor to a flat bf16 tensor in torch storage order.
+
+    Tries this repo's pure-torch table first (Q4_0 / Q8_0 / Q6_K / F16 / BF16 /
+    F32); anything else (Q4_K, Q5_K, Q2_K/Q3_K, IQ quants ...) falls back to the
+    ``gguf`` package's numpy reference dequantizer. Load-time only - the result
+    is materialized bf16, so the engine's hot path never sees these formats.
+    """
+    gt = int(t.ggml_type)
+    try:
+        return dequantize(t.packed().reshape(-1), gt, out_dtype).reshape(t.shape)
+    except (KeyError, NotImplementedError):
+        import gguf
+        import numpy as np
+
+        qt = gguf.GGMLQuantizationType(gt)
+        vals = gguf.dequantize(t.packed().numpy(), qt)
+        numel = 1
+        for d in t.shape:
+            numel *= d
+        assert vals.size == numel, f"{vals.size} != {numel} for {t.name}"
+        return torch.from_numpy(vals.reshape(t.shape)).to(out_dtype)
+
+
