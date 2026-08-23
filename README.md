@@ -98,7 +98,7 @@ powershell -File dist\run-server.ps1 -Model G:\models\my-model   # engine + web 
 ### Requirements
 
 - Windows 11, Python 3.12, VS Build Tools (for `vcvarsall.bat` + MSVC CRT link libs)
-- AMD ROCm runtime (TheRock nightly used here): `HIP_PATH=G:\ROCM10RT-gfx1201`
+- AMD ROCm runtime - **TheRock nightly** (`10.1.0a20260817`, HIP 7.16) until ROCm 10.1 ships formally; e.g. `HIP_PATH=G:\ROCM10RT-gfx1201`
 - Pip stack (matching TheRock nightly `10.1.0a20260817`):
   - `torch 2.15.0a0+rocm10.1.0a20260816` + `amd_torch_device_gfx1201` (install with `--no-deps`)
   - `triton-windows >= 3.7.1.post27` (ships the `amd` backend)

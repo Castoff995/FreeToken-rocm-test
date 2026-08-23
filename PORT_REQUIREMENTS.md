@@ -25,6 +25,8 @@ WSL, or Linux.
 
 ## 3. Python packages (TheRock nightly stack)
 
+**Note:** AMD support for this stack is nightly-only until ROCm 7.16 / 10.1 is formally released - pin every wheel to the same nightly stamp.
+
 All AMD wheels must come from the SAME nightly build stamp (rocm-sdk + torch +
 device modules). Fetch them via pip download from the whl-multi-arch index:
 
@@ -72,7 +74,7 @@ kernels work, reductions are broken upstream; leave off by default.
 | `HIP_PATH` | `G:\ROCM10RT-gfx1201` | hipcc + HIP libs for JIT builds/linking |
 | `TVM_FFI_ROCM_ARCH_LIST` | `gfx1201` | tvm-ffi emits `--offload-arch=<arch>` (defaults to gfx906 → dead kernels!) |
 | `TRITON_OVERRIDE_ARCH` | `gfx1201` | Triton codegen target |
-| `ROCM_SDK_TARGET_FAMILY` | `gfx1201` | device family for the rocm-sdk wheel runtime (nightly wheels only - drop when ROCm ships officially) |
+| `ROCM_SDK_TARGET_FAMILY` | `gfx1201` | device family for the rocm-sdk wheel runtime (TheRock nightly only - required until ROCm 7.16 / 10.1 is formally released, after which stable wheels replace the nightlies) |
 | `CC` | `<ROCM>\lib\llvm\bin\clang.EXE` | host compiler hint |
 | `FREETOKEN_SKIP_CUDA_EXT` | `1` | build-time only: skip nvcc extensions |
 
