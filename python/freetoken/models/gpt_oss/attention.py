@@ -8,6 +8,7 @@ from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, LinearOProj, LinearQKVMerged
 from freetoken.layers.rotary import get_rope
 from freetoken.models.config import FullAttentionGroupConfig, SWAAttentionGroupConfig
+from freetoken.moe import decode_trace
 from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
@@ -66,6 +67,8 @@ class GptOssAttention(BaseOP):
     @nvtx_annotate("MHA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
+        if decode_trace.trace_active():
+            decode_trace.trace_stage("attention_start", layer=self.layer_id)
         qkv = self.qkv_proj.forward(x)
         q, k, v = qkv.split(
             [self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim],
@@ -87,7 +90,11 @@ class GptOssAttention(BaseOP):
                 sinks=self.sinks,
             ),
         )
-        return self.o_proj.forward(o.view(-1, self.qo_attn_dim))
+        output = self.o_proj.forward(o.view(-1, self.qo_attn_dim))
+        if decode_trace.trace_active():
+            decode_trace.trace_stage("attention_end", layer=self.layer_id)
+            decode_trace.synchronize("attention", output.device, layer=self.layer_id)
+        return output
 
 
 __all__ = ["GptOssAttention"]

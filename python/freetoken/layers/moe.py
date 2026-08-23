@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
-from freetoken.moe import is_offload_moe_backend
+from freetoken.moe import decode_trace, is_offload_moe_backend
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
 from freetoken.utils import div_even
@@ -309,6 +309,8 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        if decode_trace.trace_active():
+            return self._decode_routed_traced(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -321,6 +323,133 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def _decode_routed_traced(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """One-shot, synchronized diagnosis of the normal GPU offload decode path.
+
+        This method is unreachable unless ``FREETOKEN_ROCM_DECODE_TRACE`` claimed the
+        current real decode batch.  Keeping it separate leaves the normal CUDA/ROCm fast
+        path's launch order and tensor semantics unchanged.
+        """
+
+        raw_ids = decode_trace.snapshot_cpu(topk_ids)
+        active, hits, misses = decode_trace.cache_hit_miss_counts(
+            raw_ids,
+            cache.slot_for_id[self.layer_id],
+            cache.num_experts,
+        )
+        decode_trace.trace_stage(
+            "cache_counts",
+            layer=self.layer_id,
+            active_unique=active,
+            hit_count=hits,
+            miss_count=misses,
+        )
+
+        decode_trace.trace_stage("cache_ensure_experts_start", layer=self.layer_id)
+        cache.ensure_experts(self.layer_id, topk_ids)
+        decode_trace.trace_stage("cache_ensure_experts_completion", layer=self.layer_id)
+        decode_trace.synchronize("cache_ensure_experts", cache.device, layer=self.layer_id)
+
+        decode_trace.trace_tensor("remapped_slot_ids", topk_ids, include_minmax=True)
+        slot_min, slot_max, selected_slots = decode_trace.validate_remapped_slots(
+            raw_ids,
+            topk_ids,
+            cache.id_of_slot,
+            layer_id=self.layer_id,
+            num_experts=cache.num_experts,
+            num_cache_slots=cache.cache_size,
+        )
+        decode_trace.trace_stage(
+            "slot_bounds_valid",
+            layer=self.layer_id,
+            slot_min=slot_min,
+            slot_max=slot_max,
+            slot_count_bound=cache.cache_size,
+            selected_slot_count=selected_slots,
+        )
+        decode_trace.trace_stage(
+            "slot_population_valid",
+            layer=self.layer_id,
+            populated_route_count=topk_ids.numel(),
+            scheduled_copy_count=int(cache.num_indices.item()),
+        )
+
+        safe_copy_selected = cache.should_use_safe_offload_copy(self.layer_id)
+        decode_trace.preflight_windows_rocm_host_mapping(
+            cache,
+            self.layer_id,
+            allow_unmapped_safe_copy=safe_copy_selected,
+        )
+        decode_trace.trace_stage(
+            "copy_missing_start",
+            layer=self.layer_id,
+            copy_stream="current_compute_stream",
+            fused_copy=cache._copy_fused_ok,
+            safe_copy_selected=safe_copy_selected,
+        )
+        cache.copy_missing()
+        decode_trace.trace_stage("copy_missing_completion", layer=self.layer_id)
+        if not safe_copy_selected:
+            decode_trace.synchronize("copy_missing", cache.device, layer=self.layer_id)
+
+        decode_trace.trace_stage("expert_views_acquisition_start", layer=self.layer_id)
+        views = cache.bank_views()
+        for name, view in zip(cache.bank_schema, views):
+            if view.shape[0] != cache.cache_size:
+                raise ValueError(
+                    f"bank {name!r} has {view.shape[0]} slots, expected {cache.cache_size}"
+                )
+            decode_trace.trace_tensor(f"expert_bank_view_{name}", view)
+        decode_trace.trace_stage(
+            "expert_views_acquired",
+            layer=self.layer_id,
+            bank_count=len(views),
+            slot_count=cache.cache_size,
+        )
+        alphas = cache.alphas_for_slots(self.layer_id)
+        decode_trace.trace_stage(
+            "scale_alpha_views_acquired",
+            layer=self.layer_id,
+            alpha_view_count=0 if alphas is None else len(alphas),
+            quant_format=cache.quant_format,
+        )
+        if alphas is not None:
+            for index, alpha in enumerate(alphas):
+                if alpha.shape[0] != cache.cache_size:
+                    raise ValueError(
+                        f"alpha view {index} has {alpha.shape[0]} slots, "
+                        f"expected {cache.cache_size}"
+                    )
+                decode_trace.trace_tensor(f"alpha_view_{index}", alpha)
+        decode_trace.synchronize("expert_view_acquisition", cache.device, layer=self.layer_id)
+
+        decode_trace.trace_stage(
+            "expert_gemm_start",
+            layer=self.layer_id,
+            quant_format=cache.quant_format,
+        )
+        output = self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=views,
+            n=None,
+            alphas=alphas,
+            is_prefill=False,
+        )
+        decode_trace.trace_stage("expert_gemm_completion", layer=self.layer_id)
+        decode_trace.synchronize("expert_gemm", output.device, layer=self.layer_id)
+        decode_trace.trace_tensor("post_moe_reduction", output)
+        decode_trace.synchronize("post_moe_reduction", output.device, layer=self.layer_id)
+        return output
 
     def _decode_hybrid(
         self,

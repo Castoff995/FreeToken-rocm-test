@@ -12,6 +12,7 @@ from freetoken.layers import (
     VocabParallelEmbedding,
 )
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.moe import decode_trace
 from freetoken.utils import nvtx_annotate
 
 from .attention import GptOssAttention
@@ -86,7 +87,13 @@ class GptOssForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
-        return self.lm_head.forward(output)
+        if decode_trace.trace_active():
+            decode_trace.trace_stage("logits_start")
+        logits = self.lm_head.forward(output)
+        if decode_trace.trace_active():
+            decode_trace.trace_stage("logits_end")
+            decode_trace.synchronize("logits", logits.device)
+        return logits
 
     def prepare_for_runtime(self) -> None:
         self.model.prepare_for_runtime()

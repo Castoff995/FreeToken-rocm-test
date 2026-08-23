@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 import freetoken.layers.moe as moe_layers
 from freetoken.layers import BaseOP, LinearReplicated, MoELayer, OffloadMoELayer
-from freetoken.moe import is_offload_moe_backend
+from freetoken.moe import decode_trace, is_offload_moe_backend
 from freetoken.moe.fused_mxfp4 import (
     MXFP4_DECODE_MAX_TOKENS,
     _transpose_mxfp4_for_decode,
@@ -186,7 +186,20 @@ class GptOssMxfp4OffloadMoELayer(OffloadMoELayer):
         assert router_logits is not None
         if not router_logits.is_contiguous():
             router_logits = router_logits.contiguous()
+        if decode_trace.trace_active():
+            decode_trace.trace_stage("routing_topk_start", layer=self.layer_id)
+            decode_trace.trace_tensor("routing_logits", router_logits)
         topk_weights, topk_ids = self._topk(router_logits)
+        if decode_trace.trace_active():
+            decode_trace.trace_stage("routing_topk_creation", layer=self.layer_id)
+            decode_trace.synchronize("routing_topk", topk_ids.device, layer=self.layer_id)
+            decode_trace.trace_tensor("routing_topk_weights", topk_weights)
+            decode_trace.trace_tensor("raw_expert_ids", topk_ids, include_minmax=True)
+            decode_trace.trace_stage("routing_id_clone_start", layer=self.layer_id)
+            routed_ids = topk_ids.clone()
+            decode_trace.trace_stage("routing_id_clone_completion", layer=self.layer_id)
+            decode_trace.synchronize("routing_id_clone", routed_ids.device, layer=self.layer_id)
+            return self.routed_forward(hidden_states, topk_weights, routed_ids)
         # routed_forward dispatches prefill/decode movement and all-reduces once;
         # topk_ids is cloned because decode rewrites it in place into slot ids.
         return self.routed_forward(hidden_states, topk_weights, topk_ids.clone())

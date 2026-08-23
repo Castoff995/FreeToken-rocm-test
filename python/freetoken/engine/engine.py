@@ -12,7 +12,7 @@ from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
-from freetoken.moe import create_moe_backend, is_offload_moe_backend
+from freetoken.moe import create_moe_backend, decode_trace, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
@@ -862,25 +862,39 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
-        with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
-            else:
-                logits = self.model.forward()
-        if self.cpu_moe_executor is not None:
-            # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
-            # -> stale expert outputs) as a loud error instead of silent corruption.
-            self.cpu_moe_executor.raise_if_unhealthy()
+        trace_started = decode_trace.begin_first_decode(batch)
+        failure: BaseException | None = None
+        try:
+            with self.ctx.forward_batch(batch):
+                if self.graph_runner.can_use_cuda_graph(batch):
+                    logits = self.graph_runner.replay(batch)
+                else:
+                    logits = self.model.forward()
+            if self.cpu_moe_executor is not None:
+                # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
+                # -> stale expert outputs) as a loud error instead of silent corruption.
+                self.cpu_moe_executor.raise_if_unhealthy()
 
-        for req in batch.reqs:
-            req.complete_one()
+            for req in batch.reqs:
+                req.complete_one()
 
-        batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+            batch_logits = logits[: batch.size]
+            if decode_trace.trace_active():
+                decode_trace.trace_stage("sampling_start")
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+            if decode_trace.trace_active():
+                decode_trace.trace_stage("sampling_end")
+                decode_trace.synchronize("sampling", next_tokens_gpu.device)
+            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            if trace_started:
+                decode_trace.finish_trace(failed=failure)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
