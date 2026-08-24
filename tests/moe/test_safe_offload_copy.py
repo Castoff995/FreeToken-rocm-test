@@ -16,22 +16,24 @@ def _mapped(host_ptr: int) -> HostMappingResult:
     return HostMappingResult(host_ptr + 0x1000, "hip_runtime", False, "ok")
 
 
-def _cache() -> OffloadMoeCache:
+def _cache(num_layers: int = 1) -> OffloadMoeCache:
     cache = OffloadMoeCache(
-        num_layers=1,
+        num_layers=num_layers,
         num_experts=4,
         cache_size=6,
         device=torch.device("cpu"),
     )
-    gate_up = torch.stack(
+    gate_up_layer = torch.stack(
         [torch.full((2, 3), expert + 1, dtype=torch.float32) for expert in range(4)]
     )
-    down = torch.stack(
+    down_layer = torch.stack(
         [torch.full((3, 2), 10 + expert, dtype=torch.float32) for expert in range(4)]
     )
+    gate_up = [gate_up_layer.clone() for _ in range(num_layers)]
+    down = [down_layer.clone() for _ in range(num_layers)]
     # Building a CPU fixture must never discover or call an installed HIP runtime.
     with mock.patch.object(torch.version, "hip", None):
-        cache.set_bank_sources({"gate_up": [gate_up], "down": [down]})
+        cache.set_bank_sources({"gate_up": gate_up, "down": down})
     cache._pending_src_layer = 0
     return cache
 
@@ -77,6 +79,10 @@ class SafeOffloadCopyTests(unittest.TestCase):
 
     def test_mapped_windows_rocm_keeps_existing_fast_path(self):
         cache = _cache()
+        cache._copy_fused_ok_by_layer = [True]
+        cache._copy_dst_ptrs = torch.tensor([0x1000, 0x2000], dtype=torch.int64)
+        cache._copy_src_ptrs = [torch.tensor([0x3000, 0x4000], dtype=torch.int64)]
+        cache._copy_feat_bytes = torch.tensor([24, 24], dtype=torch.int64)
         with (
             mock.patch.dict(os.environ, {SAFE_OFFLOAD_COPY_ENV: ""}),
             mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
@@ -86,13 +92,15 @@ class SafeOffloadCopyTests(unittest.TestCase):
                 side_effect=_mapped,
             ),
             mock.patch.object(cache, "_copy_missing_safe") as safe_copy,
-            mock.patch("freetoken.kernel.fast_index_copy_jit") as fast_copy,
+            mock.patch(
+                "freetoken.kernel.fast_index_copy.fast_index_copy_multi_jit"
+            ) as fast_copy,
         ):
             self.assertFalse(cache.should_use_safe_offload_copy(0))
             cache.copy_missing()
 
         safe_copy.assert_not_called()
-        self.assertEqual(fast_copy.call_count, len(cache.banks))
+        fast_copy.assert_called_once()
 
     def test_force_override_selects_safe_copy_for_mapped_windows_rocm(self):
         cache = _cache()
@@ -165,6 +173,158 @@ class SafeOffloadCopyTests(unittest.TestCase):
             self.assertFalse(cache.should_use_safe_offload_copy(0))
 
         self.assertEqual(resolver.call_count, len(cache.bank_schema))
+
+    def test_partial_mapping_plan_is_isolated_per_layer(self):
+        cache = _cache(num_layers=2)
+        failed = cache.bank_sources["down"][1]
+
+        def resolver(source):
+            if source is failed:
+                raise RuntimeError("unmapped")
+            return source.data_ptr() + 0x1000
+
+        plans, counts = cache._resolve_copy_source_ptrs(resolver)
+
+        self.assertIsNotNone(plans[0])
+        self.assertEqual(len(plans[0]), len(cache.banks))
+        self.assertIsNone(plans[1])
+        self.assertEqual(counts, [2, 1])
+        self.assertNotIn(failed.data_ptr(), plans[0])
+
+    def test_mapped_and_pageable_layers_dispatch_independently(self):
+        cache = _cache(num_layers=2)
+        cache.device = torch.device("cuda")
+        cache.layer_residency = ["pinned", "pageable"]
+        cache._copy_fused_ok_by_layer = [True, False]
+        cache._copy_dst_ptrs = torch.tensor([0x1000, 0x2000], dtype=torch.int64)
+        cache._copy_src_ptrs = [
+            torch.tensor([0x3000, 0x4000], dtype=torch.int64),
+            None,
+        ]
+        cache._copy_feat_bytes = torch.tensor([24, 24], dtype=torch.int64)
+
+        with (
+            mock.patch.dict(os.environ, {SAFE_OFFLOAD_COPY_ENV: ""}),
+            mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            mock.patch(
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                side_effect=_mapped,
+            ),
+            mock.patch.object(cache, "_copy_missing_safe") as safe_copy,
+            mock.patch(
+                "freetoken.kernel.fast_index_copy.fast_index_copy_multi_jit"
+            ) as fused_copy,
+            mock.patch("freetoken.kernel.fast_index_copy_jit") as per_bank_copy,
+        ):
+            cache._pending_src_layer = 0
+            self.assertFalse(cache.should_use_safe_offload_copy(0))
+            cache.copy_missing()
+            cache._pending_src_layer = 1
+            self.assertTrue(cache.should_use_safe_offload_copy(1))
+            cache.copy_missing()
+
+        fused_copy.assert_called_once()
+        safe_copy.assert_called_once_with(1)
+        per_bank_copy.assert_not_called()
+
+    def test_unmapped_windows_rocm_layer_never_reaches_any_fast_kernel(self):
+        cache = _cache()
+        cache.device = torch.device("cuda")
+        cache.layer_residency = ["pageable"]
+        cache._copy_fused_ok_by_layer = [False]
+        raw_host_pointers = {
+            source.data_ptr()
+            for per_layer, _destination in cache.banks
+            for source in per_layer
+        }
+
+        with (
+            mock.patch.dict(os.environ, {SAFE_OFFLOAD_COPY_ENV: ""}),
+            mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            mock.patch.object(cache, "_copy_missing_safe") as safe_copy,
+            mock.patch(
+                "freetoken.kernel.fast_index_copy.fast_index_copy_multi_jit"
+            ) as fused_copy,
+            mock.patch("freetoken.kernel.fast_index_copy_jit") as per_bank_copy,
+        ):
+            cache.copy_missing()
+
+        safe_copy.assert_called_once_with(0)
+        fused_copy.assert_not_called()
+        per_bank_copy.assert_not_called()
+        descriptor_pointers = {
+            int(pointer)
+            for pointers in cache._copy_src_ptrs_host
+            for pointer in pointers
+        }
+        self.assertTrue(raw_host_pointers.isdisjoint(descriptor_pointers))
+
+    def test_force_safe_override_applies_to_every_layer_without_probing(self):
+        cache = _cache(num_layers=2)
+        cache.device = torch.device("cuda")
+        cache._copy_fused_ok_by_layer = [True, True]
+        with (
+            mock.patch.dict(os.environ, {SAFE_OFFLOAD_COPY_ENV: "1"}),
+            mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            mock.patch(
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                side_effect=AssertionError("force-safe must not probe"),
+            ) as resolver,
+        ):
+            self.assertTrue(cache.should_use_safe_offload_copy(0))
+            self.assertTrue(cache.should_use_safe_offload_copy(1))
+
+        resolver.assert_not_called()
+
+    def test_pageable_residency_is_accepted_only_for_windows_rocm(self):
+        cache = _cache()
+        sources = {
+            name: [source.clone() for source in per_layer]
+            for name, per_layer in cache.bank_sources.items()
+        }
+        with (
+            mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+        ):
+            cache.set_bank_sources(sources, layer_residency=["pageable"])
+        self.assertEqual(cache.layer_residency, ["pageable"])
+
+        with (
+            mock.patch("freetoken.moe.offload_cache.sys.platform", "linux"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            self.assertRaisesRegex(NotImplementedError, "Windows ROCm"),
+        ):
+            cache.set_bank_sources(sources, layer_residency=["pageable"])
+
+    def test_pageable_prefill_uses_ordinary_tensor_copy_not_pointer_split(self):
+        cache = OffloadMoeCache(
+            num_layers=1,
+            num_experts=4,
+            cache_size=8,
+            device=torch.device("cpu"),
+            prefill_overlap=True,
+            prefill_hit_d2d=True,
+        )
+        sources = {
+            "gate_up": [torch.arange(24, dtype=torch.float32).view(4, 2, 3)],
+            "down": [torch.arange(24, dtype=torch.float32).view(4, 3, 2)],
+        }
+        with (
+            mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+        ):
+            cache.set_bank_sources(sources, layer_residency=["pageable"])
+
+        with mock.patch.object(cache, "_prefetch_split") as pointer_split:
+            cache.begin_prefill()
+            cache.prefetch_prefill_layer(0)
+
+        pointer_split.assert_not_called()
+        for (per_layer, _destination), buffer in zip(cache.banks, cache.prefill_bank_buffers):
+            torch.testing.assert_close(buffer[0], per_layer[0])
 
     def test_safe_copy_plan_preserves_staged_lru_pairs(self):
         cache = _cache()

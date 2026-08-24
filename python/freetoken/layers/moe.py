@@ -391,7 +391,7 @@ class OffloadMoELayer(MoELayer):
             "copy_missing_start",
             layer=self.layer_id,
             copy_stream="current_compute_stream",
-            fused_copy=cache._copy_fused_ok,
+            fused_copy=cache._copy_fused_ok_by_layer[self.layer_id],
             safe_copy_selected=safe_copy_selected,
         )
         cache.copy_missing()

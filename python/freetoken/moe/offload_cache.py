@@ -237,8 +237,10 @@ class OffloadMoeCache:
         # Source pointers are per layer (_copy_src_ptrs[layer_id] -> [num_banks] device
         # tensor); dst/feat are layer-invariant.
         self._copy_fused_ok = False
+        self._copy_fused_ok_by_layer: list[bool] = [False] * self.num_layers
+        self._mapped_bank_count_by_layer: list[int] = [0] * self.num_layers
         self._copy_dst_ptrs: torch.Tensor | None = None
-        self._copy_src_ptrs: list[torch.Tensor] | None = None
+        self._copy_src_ptrs: list[torch.Tensor | None] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
         # The layer whose misses ensure_experts/materialize_layer staged last; consumed
         # by copy_missing to pick the per-layer source (part of the same pending-copy
@@ -283,9 +285,9 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value
-        (default: all pinned). Non-pinned layers have no device address, so the
-        GPU movement paths cannot serve them and they are rejected here
-        (platform-specific residency policies are not implemented).
+        (default: all pinned). Windows ROCm may retain a pageable layer when any
+        required bank could not be registered; that layer uses ordinary PyTorch
+        H2D copies for prefill and decode. Other platforms retain fail-fast policy.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -294,11 +296,21 @@ class OffloadMoeCache:
             f"schema {self.bank_schema}"
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
+        residency = [getattr(value, "value", value) for value in residency]
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
-        if any(r != HostResidency.PINNED.value for r in residency):
+        invalid = [
+            value
+            for value in residency
+            if value not in {HostResidency.PINNED.value, HostResidency.PAGEABLE.value}
+        ]
+        windows_rocm = sys.platform == "win32" and bool(getattr(torch.version, "hip", None))
+        if invalid or (
+            any(value == HostResidency.PAGEABLE.value for value in residency)
+            and not windows_rocm
+        ):
             raise NotImplementedError(
-                "non-pinned host bank layers need platform-specific movement "
-                "paths that are not implemented; only pinned layers are served"
+                "pageable host-bank layers are supported only by the Windows ROCm "
+                "staged-copy fallback; locked or other residency classes are unsupported"
             )
         self.layer_residency = list(residency)
         for name in self.bank_schema:
@@ -320,8 +332,47 @@ class OffloadMoeCache:
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._host_mapping_safe = [None] * self.num_layers
         self._build_copy_plan()
+        if windows_rocm:
+            mapped_layers = sum(self._copy_fused_ok_by_layer)
+            mapped_banks = sum(self._mapped_bank_count_by_layer)
+            fallback_layers = self.num_layers - mapped_layers
+            log = logger.warning if fallback_layers else logger.info
+            log(
+                "Windows ROCm MoE host mapping: "
+                f"mapped_fast_layers={mapped_layers}/{self.num_layers} "
+                f"mapped_banks={mapped_banks}/{self.num_layers * len(self.banks)} "
+                f"safe_copy_layers={fallback_layers}"
+            )
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+
+    def _resolve_copy_source_ptrs(self, resolver) -> tuple[list[list[int] | None], list[int]]:
+        """Resolve every bank independently and return complete per-layer plans.
+
+        A partial layer deliberately has no pointer plan. Continuing across its remaining
+        banks preserves per-layer isolation and diagnostics without ever retaining a raw
+        CPU address as a usable GPU source pointer.
+        """
+
+        resolved: list[list[int] | None] = [None] * self.num_layers
+        mapped_counts = [0] * self.num_layers
+        for layer_id in range(self.num_layers):
+            pointers: list[int] = []
+            complete = True
+            for per_layer, _cache in self.banks:
+                try:
+                    pointer = int(resolver(per_layer[layer_id]))
+                except RuntimeError:
+                    complete = False
+                    continue
+                if pointer <= 0 or pointer % 16 != 0:
+                    complete = False
+                    continue
+                mapped_counts[layer_id] += 1
+                pointers.append(pointer)
+            if complete and len(pointers) == len(self.banks):
+                resolved[layer_id] = pointers
+        return resolved, mapped_counts
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
@@ -332,6 +383,8 @@ class OffloadMoeCache:
         address is not 16-byte aligned, or via FREETOKEN_FUSED_COPY=0.
         """
         self._copy_fused_ok = False
+        self._copy_fused_ok_by_layer = [False] * self.num_layers
+        self._mapped_bank_count_by_layer = [0] * self.num_layers
         self._copy_dst_ptrs = None
         self._copy_src_ptrs = None
         self._copy_feat_bytes = None
@@ -346,35 +399,25 @@ class OffloadMoeCache:
         from freetoken.kernel.pinned import device_ptr
 
         dst_ptrs, feats = [], []
-        layer_src_ptrs = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
             feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
-                return  # leave fused disabled; copy_missing uses the per-bank path
-            for layer_id, source in enumerate(per_layer):
-                # The kernel dereferences these on the GPU, so store each host bank's
-                # device alias (== data_ptr() under UVA identity; differs on
-                # Windows/WDDM).
-                try:
-                    src_dev = device_ptr(source)
-                except RuntimeError:
-                    # A missing mapping is not fatal on Windows ROCm: decode capability
-                    # inspection will select the staged PyTorch H2D fallback. Leave the
-                    # fused pointer plan disabled rather than storing a raw CPU VA.
-                    return
-                if src_dev % 16 != 0:
-                    return
-                layer_src_ptrs[layer_id].append(src_dev)
+                return  # all Windows ROCm layers safely stage; other platforms use legacy
             dst_ptrs.append(cache.data_ptr())
             feats.append(feat)
+        layer_src_ptrs, mapped_counts = self._resolve_copy_source_ptrs(device_ptr)
+        self._mapped_bank_count_by_layer = mapped_counts
+        self._copy_fused_ok_by_layer = [pointers is not None for pointers in layer_src_ptrs]
+        if not any(self._copy_fused_ok_by_layer):
+            return
         self._copy_dst_ptrs = torch.tensor(dst_ptrs, dtype=torch.int64, device=self.device)
         self._copy_src_ptrs = [
-            torch.tensor(ptrs, dtype=torch.int64, device=self.device)
+            torch.tensor(ptrs, dtype=torch.int64, device=self.device) if ptrs is not None else None
             for ptrs in layer_src_ptrs
         ]
         self._copy_feat_bytes = torch.tensor(feats, dtype=torch.int64, device=self.device)
         self._copy_dst_ptrs_host = dst_ptrs
-        self._copy_src_ptrs_host = layer_src_ptrs
+        self._copy_src_ptrs_host = [ptrs or [] for ptrs in layer_src_ptrs]
         self._copy_feat_bytes_host = feats
         # hit-D2D gather serves only the big banks; small banks are whole-layer
         # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
@@ -385,7 +428,9 @@ class OffloadMoeCache:
         elif self._gather_bank_ids:
             self._gather_dst_ptrs = self._copy_dst_ptrs[self._gather_bank_ids].contiguous()
             self._gather_feat_bytes = self._copy_feat_bytes[self._gather_bank_ids].contiguous()
-        self._copy_fused_ok = True
+        # The legacy global flag now means every layer is usable, which is required by
+        # the optional prefill pointer plan. Decode uses the per-layer flags directly.
+        self._copy_fused_ok = all(self._copy_fused_ok_by_layer)
 
     def validate_rebuild(self, cache_size: int) -> None:
         """Pure geometry validation of a rebuild target (no GPU side effects).
@@ -862,6 +907,17 @@ class OffloadMoeCache:
         if os.getenv(SAFE_OFFLOAD_COPY_ENV, "").strip().lower() in _ENV_TRUE:
             return True
 
+        # Registration metadata is authoritative when present: a partial/pageable layer
+        # must not be probed into the fast path. On a real accelerator, the mapped fast
+        # path also requires a complete fused descriptor because the legacy per-bank
+        # tensor argument would carry the Windows host VA rather than its HIP device alias.
+        if self.layer_residency[layer_id] != "pinned":
+            self._host_mapping_safe[layer_id] = False
+            return True
+        if self.device.type == "cuda" and not self._copy_fused_ok_by_layer[layer_id]:
+            self._host_mapping_safe[layer_id] = False
+            return True
+
         from freetoken.moe.decode_trace import inspect_host_mapping
 
         # Windows/WDDM can map registered host memory at a device address different
@@ -1033,8 +1089,13 @@ class OffloadMoeCache:
         if self.should_use_safe_offload_copy(layer_id):
             self._copy_missing_safe(layer_id)
             return
-        if self._copy_fused_ok:
+        if self._copy_fused_ok_by_layer[layer_id]:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+            assert self._copy_dst_ptrs is not None
+            assert self._copy_src_ptrs is not None
+            assert self._copy_src_ptrs[layer_id] is not None
+            assert self._copy_feat_bytes is not None
 
             # One launch copies the missing rows for every bank (instead of one launch per
             # bank). evict_slots/src_indices/num_indices are shared across banks;
@@ -1048,6 +1109,13 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+            return
+
+        if sys.platform == "win32" and getattr(torch.version, "hip", None):
+            # Defense in depth: Windows/WDDM mapped aliases can differ from host VAs.
+            # The legacy per-bank kernel receives a tensor's raw data_ptr, so it is never
+            # a valid fallback here when the alias-bearing fused plan is unavailable.
+            self._copy_missing_safe(layer_id)
             return
 
         from freetoken.kernel import fast_index_copy_jit

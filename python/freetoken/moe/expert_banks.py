@@ -40,13 +40,22 @@ class ExpertBanks:
     # marlin/b12x per-expert global scales ([L*E]); None for formats without them
     gate_up_alpha: torch.Tensor | None = field(default=None)
     down_alpha: torch.Tensor | None = field(default=None)
-    # Per-layer HostResidency values; None -> all pinned (the only class
-    # served; policies that assign other classes are not implemented).
+    # Per-layer HostResidency values; None -> infer HostBank-backed sources, then
+    # retain the historical all-pinned default for providers without metadata.
     layer_residency: list[str] | None = field(default=None)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
     streamed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.layer_residency is not None:
+            return
+        from freetoken.moe.host_banks import infer_host_layer_residency
+
+        inferred = infer_host_layer_residency(self.sources)
+        if inferred is not None:
+            object.__setattr__(self, "layer_residency", inferred)
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader

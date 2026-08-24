@@ -22,11 +22,17 @@ import math
 import mmap
 import os
 import queue
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
 import torch
+
+from freetoken.utils import init_logger
+
+
+logger = init_logger(__name__)
 
 _BLK = 4096  # O_DIRECT alignment (page size)
 
@@ -35,11 +41,10 @@ class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
     ``PINNED`` (cudaHostRegister'd) is required for anything the GPU dereferences:
-    the decode gather kernels and the DMA prefill copies. ``LOCKED`` (VirtualLock /
-    mlock: resident for the CPU executor, but with no device address) and
-    ``PAGEABLE`` are reserved for platforms where the pin quota cannot cover every
-    layer (Windows/WDDM); their movement paths are not implemented here -- layers
-    with either class must be served by the CPU executor.
+    the decode gather kernels and pointer-based prefill copies. ``PAGEABLE`` is served
+    through ordinary PyTorch H2D copies on Windows ROCm when registration fails.
+    ``LOCKED`` (VirtualLock/mlock: resident for the CPU executor, but with no device
+    address) remains reserved for CPU-executor policies that are not implemented here.
     """
 
     PINNED = "pinned"
@@ -48,6 +53,8 @@ class HostResidency(str, Enum):
 
 
 _DEFAULT_CHUNK = 8 << 20
+_HOST_RESIDENCY_ATTR = "_freetoken_host_residency"
+_HOST_PIN_ERROR_ATTR = "_freetoken_host_pin_error"
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
@@ -60,7 +67,7 @@ class HostBank:
     rounded up to the O_DIRECT block so chunked reads are always aligned; ``tensor`` views
     exactly ``nbytes``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_pin_error")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype):
         elsize = torch.empty((), dtype=dtype).element_size()
@@ -71,6 +78,9 @@ class HostBank:
         self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._pinned = False
+        self._pin_error: str | None = None
+        setattr(self.tensor, _HOST_RESIDENCY_ATTR, HostResidency.PAGEABLE.value)
+        setattr(self.tensor, _HOST_PIN_ERROR_ATTR, None)
 
     @property
     def residency(self) -> HostResidency:
@@ -80,7 +90,7 @@ class HostBank:
         return memoryview(self._buf)
 
     def pin(self) -> None:
-        """cudaHostRegister the (now-filled, resident) buffer -- pin-after-fill."""
+        """Register and map the now-filled resident buffer -- pin-after-fill."""
         if self._pinned:
             return
         from freetoken.kernel.pinned import host_register
@@ -88,10 +98,16 @@ class HostBank:
         try:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
+            self._pin_error = str(exc)
+            setattr(self.tensor, _HOST_RESIDENCY_ATTR, HostResidency.PAGEABLE.value)
+            setattr(self.tensor, _HOST_PIN_ERROR_ATTR, self._pin_error)
             raise RuntimeError(
                 f"host registration failed for {len(self._buf) / 2**30:.1f} GiB"
             ) from exc
         self._pinned = True
+        self._pin_error = None
+        setattr(self.tensor, _HOST_RESIDENCY_ATTR, HostResidency.PINNED.value)
+        setattr(self.tensor, _HOST_PIN_ERROR_ATTR, None)
 
     def release(self) -> None:
         """Drop the buffer's resident pages (address space stays valid; contents
@@ -137,19 +153,61 @@ def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
             bank.pin()
 
 
+def _windows_rocm_pageable_fallback() -> bool:
+    return sys.platform == "win32" and bool(getattr(torch.version, "hip", None))
+
+
+def infer_host_layer_residency(
+    sources: dict[str, list[torch.Tensor]],
+) -> list[str] | None:
+    """Infer per-layer residency from tensors backed by :class:`HostBank`.
+
+    ``None`` preserves the historical default for providers that do not expose
+    HostBank metadata. Once any source exposes metadata, a layer is considered pinned
+    only when every required bank explicitly reports successful registration.
+    """
+
+    if not sources:
+        return None
+    num_layers = len(next(iter(sources.values())))
+    values = [
+        getattr(source, _HOST_RESIDENCY_ATTR, None)
+        for per_layer in sources.values()
+        for source in per_layer
+    ]
+    if not any(value is not None for value in values):
+        return None
+
+    residency: list[str] = []
+    for layer_id in range(num_layers):
+        states = [
+            getattr(per_layer[layer_id], _HOST_RESIDENCY_ATTR, None)
+            for per_layer in sources.values()
+        ]
+        if all(state == HostResidency.PINNED.value for state in states):
+            residency.append(HostResidency.PINNED.value)
+        else:
+            residency.append(HostResidency.PAGEABLE.value)
+    return residency
+
+
 class PinPipeline:
     """Pin filled banks while other banks are still being read.
 
     cudaHostRegister is driver-serialized, so one background thread drains a
     queue of completed banks; submitters never block. Total load time becomes
     ~max(read, pin) instead of their sum. Use as a context manager: a clean exit
-    drains the queue and re-raises the first pin failure; an exceptional exit
-    still joins the thread but lets the original exception propagate.
+    drains the queue and re-raises the first pin failure, except that Windows ROCm
+    registration failures retain that bank as pageable and continue. An exceptional
+    exit still joins the thread but lets the original exception propagate.
     """
 
     def __init__(self) -> None:
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._exc: BaseException | None = None
+        self._mapped_count = 0
+        self._pageable_count = 0
+        self._first_fallback: BaseException | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -162,7 +220,17 @@ class PinPipeline:
                 continue  # drain without pinning after a failure
             try:
                 bank.pin()
+                self._mapped_count += 1
             except BaseException as exc:  # surfaced by wait()/__exit__
+                if _windows_rocm_pageable_fallback() and isinstance(exc, RuntimeError):
+                    # Windows/WDDM may reject an individual hipHostRegister even after
+                    # earlier banks succeeded. Keep this bank as ordinary host memory;
+                    # residency-aware cache dispatch will stage its whole layer through
+                    # PyTorch H2D and must never expose its raw CPU VA to a GPU kernel.
+                    self._pageable_count += 1
+                    if self._first_fallback is None:
+                        self._first_fallback = exc
+                    continue
                 self._exc = exc
 
     def submit(self, bank: HostBank) -> None:
@@ -181,6 +249,15 @@ class PinPipeline:
         self._join()
         if self._exc is not None:
             raise self._exc
+        if self._pageable_count:
+            first = self._first_fallback
+            reason = first.__cause__ if first is not None and first.__cause__ else first
+            logger.warning(
+                "Windows ROCm host mapping fallback: "
+                f"mapped_banks={self._mapped_count} "
+                f"pageable_banks={self._pageable_count} "
+                f"first_failure={reason}"
+            )
 
     def __enter__(self) -> "PinPipeline":
         return self
@@ -263,6 +340,7 @@ __all__ = [
     "PinPipeline",
     "alloc_banks",
     "alloc_layer_banks",
+    "infer_host_layer_residency",
     "pin_banks",
     "read_file_into",
 ]
