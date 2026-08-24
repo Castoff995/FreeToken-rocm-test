@@ -357,6 +357,12 @@ class OffloadMoeCache:
         resolved: list[list[int] | None] = [None] * self.num_layers
         mapped_counts = [0] * self.num_layers
         for layer_id in range(self.num_layers):
+            # HostBank registration metadata is authoritative. In particular, a
+            # budget-skipped Windows ROCm layer is intentionally pageable: do not call
+            # hipHostGetDevicePointer for it, do not manufacture a mapping failure, and
+            # leave its pointer plan absent so only staged PyTorch H2D can consume it.
+            if self.layer_residency[layer_id] != "pinned":
+                continue
             pointers: list[int] = []
             complete = True
             for per_layer, _cache in self.banks:

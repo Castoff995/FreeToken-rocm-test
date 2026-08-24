@@ -25,6 +25,7 @@ import queue
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 
 import torch
@@ -55,6 +56,8 @@ class HostResidency(str, Enum):
 _DEFAULT_CHUNK = 8 << 20
 _HOST_RESIDENCY_ATTR = "_freetoken_host_residency"
 _HOST_PIN_ERROR_ATTR = "_freetoken_host_pin_error"
+_PIN_BUDGET_ENV = "FREETOKEN_PIN_BUDGET_GB"
+_GIB = 1 << 30
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
@@ -85,6 +88,11 @@ class HostBank:
     @property
     def residency(self) -> HostResidency:
         return HostResidency.PINNED if self._pinned else HostResidency.PAGEABLE
+
+    @property
+    def registration_nbytes(self) -> int:
+        """Actual page-aligned byte count passed to ``hipHostRegister``."""
+        return len(self._buf)
 
     def memoryview(self) -> memoryview:
         return memoryview(self._buf)
@@ -157,6 +165,32 @@ def _windows_rocm_pageable_fallback() -> bool:
     return sys.platform == "win32" and bool(getattr(torch.version, "hip", None))
 
 
+def _windows_rocm_pin_budget_bytes() -> int | None:
+    """Parse the opt-in Windows ROCm host-registration budget in GiB."""
+
+    if not _windows_rocm_pageable_fallback():
+        return None
+    raw = os.environ.get(_PIN_BUDGET_ENV)
+    if raw is None:
+        return None
+    try:
+        value = Decimal(raw.strip())
+    except InvalidOperation as exc:
+        raise ValueError(
+            f"{_PIN_BUDGET_ENV} must be a finite number greater than zero, got {raw!r}"
+        ) from exc
+    if not value.is_finite() or value <= 0:
+        raise ValueError(
+            f"{_PIN_BUDGET_ENV} must be a finite number greater than zero, got {raw!r}"
+        )
+    budget_bytes = int(value * _GIB)
+    if budget_bytes <= 0:
+        raise ValueError(
+            f"{_PIN_BUDGET_ENV} is too small to represent at least one byte, got {raw!r}"
+        )
+    return budget_bytes
+
+
 def infer_host_layer_residency(
     sources: dict[str, list[torch.Tensor]],
 ) -> list[str] | None:
@@ -205,56 +239,95 @@ class PinPipeline:
     def __init__(self) -> None:
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._exc: BaseException | None = None
+        self._budget_bytes = _windows_rocm_pin_budget_bytes()
+        self._attempted_pin_bytes = 0
+        self._successfully_pinned_bytes = 0
+        self._budget_skipped_bytes = 0
         self._mapped_count = 0
         self._pageable_count = 0
+        self._mapped_layers = 0
+        self._budget_skipped_banks = 0
+        self._budget_skipped_layer_ids: set[int] = set()
         self._first_fallback: BaseException | None = None
+        if self._budget_bytes is not None:
+            logger.info(
+                "Windows ROCm host pin budget: "
+                f"budget_GiB={self._budget_bytes / _GIB:.3f}"
+            )
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
         while True:
-            bank = self._q.get()
-            if bank is None:
+            item = self._q.get()
+            if item is None:
                 return
             if self._exc is not None:
                 continue  # drain without pinning after a failure
-            try:
-                bank.pin()
-                self._mapped_count += 1
-            except BaseException as exc:  # surfaced by wait()/__exit__
-                if _windows_rocm_pageable_fallback() and isinstance(exc, RuntimeError):
-                    from freetoken.kernel.pinned import (
-                        _clear_recoverable_hip_host_register_error,
-                    )
+            layer_id, banks = item
+            group_nbytes = sum(bank.registration_nbytes for bank in banks)
+            if (
+                self._budget_bytes is not None
+                and self._successfully_pinned_bytes + group_nbytes > self._budget_bytes
+            ):
+                # Intentional budget skips make no HIP call and attach no fake pin
+                # error. The complete layer stays pageable, so the existing Windows
+                # ROCm dispatch must stage it through safe PyTorch H2D.
+                self._budget_skipped_bytes += group_nbytes
+                self._budget_skipped_banks += len(banks)
+                self._pageable_count += len(banks)
+                if layer_id is not None:
+                    self._budget_skipped_layer_ids.add(layer_id)
+                continue
 
-                    # A failed direct ctypes hipHostRegister leaves HIP's last-error
-                    # state sticky. Clear only here, where that exact failure is being
-                    # accepted as a Windows ROCm pageable fallback. The original status
-                    # remains embedded in ``exc`` for the warning below.
-                    try:
-                        _clear_recoverable_hip_host_register_error(exc)
-                    except BaseException as clear_exc:
-                        # Continuing would let the next otherwise-valid PyTorch call
-                        # surface the uncleared HIP error with a misleading traceback.
-                        self._exc = clear_exc
+            group_all_mapped = True
+            for bank in banks:
+                self._attempted_pin_bytes += bank.registration_nbytes
+                try:
+                    bank.pin()
+                    self._successfully_pinned_bytes += bank.registration_nbytes
+                    self._mapped_count += 1
+                except BaseException as exc:  # surfaced by wait()/__exit__
+                    group_all_mapped = False
+                    if _windows_rocm_pageable_fallback() and isinstance(exc, RuntimeError):
+                        from freetoken.kernel.pinned import (
+                            _clear_recoverable_hip_host_register_error,
+                        )
+
+                        # A failed direct ctypes hipHostRegister leaves HIP's last-error
+                        # state sticky. Clear only here, where that exact failure is being
+                        # accepted as a Windows ROCm pageable fallback. The original status
+                        # remains embedded in ``exc`` for the warning below.
+                        try:
+                            _clear_recoverable_hip_host_register_error(exc)
+                        except BaseException as clear_exc:
+                            # Continuing would let the next otherwise-valid PyTorch call
+                            # surface the uncleared HIP error with a misleading traceback.
+                            self._exc = clear_exc
+                            break
+                        # Windows/WDDM may reject an individual hipHostRegister even after
+                        # earlier banks succeeded. Keep this bank as ordinary host memory;
+                        # residency-aware cache dispatch will stage its whole layer through
+                        # PyTorch H2D and must never expose its raw CPU VA to a GPU kernel.
+                        self._pageable_count += 1
+                        if self._first_fallback is None:
+                            self._first_fallback = exc
                         continue
-                    # Windows/WDDM may reject an individual hipHostRegister even after
-                    # earlier banks succeeded. Keep this bank as ordinary host memory;
-                    # residency-aware cache dispatch will stage its whole layer through
-                    # PyTorch H2D and must never expose its raw CPU VA to a GPU kernel.
-                    self._pageable_count += 1
-                    if self._first_fallback is None:
-                        self._first_fallback = exc
-                    continue
-                self._exc = exc
+                    self._exc = exc
+                    break
+            if layer_id is not None and group_all_mapped and self._exc is None:
+                self._mapped_layers += 1
 
     def submit(self, bank: HostBank) -> None:
-        self._q.put(bank)
+        self._q.put((None, (bank,)))
+
+    def submit_layer(self, layer_id: int, banks: dict[str, HostBank]) -> None:
+        """Queue a complete layer as one indivisible budget decision."""
+        self._q.put((layer_id, tuple(banks.values())))
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
-        """Layer-completion sink: queue every bank of the completed layer."""
-        for bank in banks.values():
-            self.submit(bank)
+        """Layer-completion sink: queue the completed layer as one work item."""
+        self.submit_layer(layer_id, banks)
 
     def _join(self) -> None:
         self._q.put(None)
@@ -264,6 +337,24 @@ class PinPipeline:
         self._join()
         if self._exc is not None:
             raise self._exc
+        if self._budget_bytes is not None:
+            first = self._first_fallback
+            reason = first.__cause__ if first is not None and first.__cause__ else first
+            log = logger.warning if first is not None else logger.info
+            log(
+                "Windows ROCm host pin summary: "
+                f"budget_GiB={self._budget_bytes / _GIB:.3f} "
+                f"attempted_pin_GiB={self._attempted_pin_bytes / _GIB:.3f} "
+                f"successfully_pinned_GiB={self._successfully_pinned_bytes / _GIB:.3f} "
+                f"budget_skipped_GiB={self._budget_skipped_bytes / _GIB:.3f} "
+                f"mapped_banks={self._mapped_count} "
+                f"pageable_banks={self._pageable_count} "
+                f"mapped_layers={self._mapped_layers} "
+                f"budget_skipped_banks={self._budget_skipped_banks} "
+                f"budget_skipped_layers={len(self._budget_skipped_layer_ids)} "
+                f"first_registration_failure={reason if reason is not None else 'none'}"
+            )
+            return
         if self._pageable_count:
             first = self._first_fallback
             reason = first.__cause__ if first is not None and first.__cause__ else first

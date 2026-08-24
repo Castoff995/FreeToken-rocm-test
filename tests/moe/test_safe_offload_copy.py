@@ -191,6 +191,18 @@ class SafeOffloadCopyTests(unittest.TestCase):
         self.assertEqual(counts, [2, 1])
         self.assertNotIn(failed.data_ptr(), plans[0])
 
+    def test_pageable_layer_is_never_probed_for_a_fast_pointer_plan(self):
+        cache = _cache(num_layers=2)
+        cache.layer_residency = ["pinned", "pageable"]
+        resolver = mock.Mock(side_effect=lambda source: source.data_ptr() + 0x1000)
+
+        plans, counts = cache._resolve_copy_source_ptrs(resolver)
+
+        self.assertIsNotNone(plans[0])
+        self.assertIsNone(plans[1])
+        self.assertEqual(counts, [len(cache.banks), 0])
+        self.assertEqual(resolver.call_count, len(cache.banks))
+
     def test_mapped_and_pageable_layers_dispatch_independently(self):
         cache = _cache(num_layers=2)
         cache.device = torch.device("cuda")
