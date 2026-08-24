@@ -213,24 +213,111 @@ BEST_CURRENT_BUILD=CUSTOM
 CUSTOM_12G_OR_UPSTREAM=CUSTOM_12G
 ```
 
+Да. Я бы **заменил всё начиная с `## Comparison summary` и до конца** вот на это:
+
+```md
 ## Comparison summary
 
-| Metric | Custom 12 GiB | Upstream main | PR #137 |
-| --- | ---: | ---: | ---: |
-| API ready | YES | NO | NO |
-| Pinned GiB | 11.854 | N/A | N/A |
-| Fast layers | 28/40 | N/A | N/A |
-| Safe-copy layers | 12/40 | N/A | N/A |
-| Median TTFT | 1187.6 ms | N/A | N/A |
-| Median decode | 13.92 tok/s | N/A | N/A |
-| Translation E2E | 4.024 s | N/A | N/A |
-| E2E serving | PASS | Not runnable | Not runnable |
-| TDR / reset | NO / NO | NO / NO | NO / NO |
+| Metric | Custom 12 GiB | Upstream main | PR #137 | llama.cpp HIP / exact NVFP4 |
+| --- | ---: | ---: | ---: | ---: |
+| API ready | YES | NO | NO | YES |
+| Model / quantization | Qwen3.6 NVFP4 | N/A | N/A | Same Qwen3.6 NVFP4 checkpoint |
+| Pinned GiB | 11.854 | N/A | N/A | N/A |
+| Fast layers | 28/40 | N/A | N/A | N/A |
+| Safe-copy layers | 12/40 | N/A | N/A | N/A |
+| VRAM after load | approximately 14.151 GiB | N/A | N/A | approximately 14.946 GiB |
+| Median TTFT | 1187.6 ms | N/A | N/A | N/A |
+| Median decode | 13.92 tok/s | N/A | N/A | N/A |
+| Translation E2E | 4.024 s | N/A | N/A | N/A |
+| E2E serving | PASS | Not runnable | Not runnable | FAIL on first inference |
+| TDR / reset | NO / NO | NO / NO | NO / NO | NO / NO |
 
-## Next comparison
+## llama.cpp exact-NVFP4 comparison
 
-The next meaningful experiment is to compare the custom FreeToken build with a
-conventional AMD-friendly runtime such as llama.cpp, using the same model when
-format compatibility permits. If exact format parity is impossible, the
-closest equivalent quantization should be used and the limitation stated
-explicitly. No llama.cpp performance numbers have been collected here.
+A direct comparison against official llama.cpp was attempted using the same
+`Qwen3.6-35B-A3B-NVFP4` source checkpoint.
+
+The checkpoint was converted with the official llama.cpp converter to a
+`MOSTLY_NVFP4` GGUF. The NVFP4 expert weights were transferred directly rather
+than requantized. The remaining FP8 tensors were represented as BF16 by the
+converter.
+
+The resulting configuration was:
+
+```text
+llama.cpp=b10566
+commit=bb4caa754
+backend=HIP
+ROCm=7.14.0
+GPU=AMD Radeon RX 9070 XT
+GPU_arch=gfx1201
+
+model=Qwen3.6-35B-A3B-NVFP4
+parameters=34,660,672,370
+GGUF_file_type=MOSTLY_NVFP4
+GGUF_size=20.638 GiB
+
+API_ready=YES
+VRAM_after_load≈14.946 GiB
+```
+
+The model loaded successfully, the RX 9070 XT was detected as `gfx1201`, and
+the OpenAI-compatible API became available.
+
+However, the first real inference request terminated the llama.cpp backend
+during matrix multiplication:
+
+```text
+ggml_cuda_compute_forward: MUL_MAT failed
+ROCm error: invalid argument
+ggml-cuda.cu:2408
+```
+
+The failure terminated the llama.cpp process, but did not cause a Windows TDR
+or GPU driver reset:
+
+```text
+HIP_fatal=YES
+TDR=NO
+driver_reset=NO
+```
+
+Because llama.cpp did not produce a successful first token, no valid TTFT,
+decode throughput, translation, or `llama-bench` performance measurements were
+collected.
+
+The resulting classification is:
+
+```text
+PARITY_CLASS=EXACT_MODEL_NVFP4_GGUF
+ENGINE_COMPARISON_VALID=NO
+ENGINE_VERDICT=INCONCLUSIVE_LLAMA_CPP_HIP_NVFP4_RUNTIME_FAILURE
+```
+
+This should **not** be interpreted as a measured FreeToken performance victory:
+there are no comparable llama.cpp throughput numbers. It is instead a practical
+availability result for the tested configuration: the custom FreeToken build
+completed stable end-to-end inference on this system, while the exact-model
+llama.cpp HIP/NVFP4 path failed at its first real compute.
+
+The llama.cpp failure is tracked upstream:
+
+[ggml-org/llama.cpp #27670 — Windows HIP gfx1201: Qwen3.6-35B-A3B NVFP4 loads, then first MUL_MAT fails with ROCm invalid argument](https://github.com/ggml-org/llama.cpp/issues/27670)
+
+## Current status
+
+For the tested Windows / RX 9070 XT / gfx1201 configuration:
+
+```text
+BEST_CURRENT_CONFIRMED_E2E_BUILD=CUSTOM_FREETOKEN
+BEST_VALIDATED_PIN_BUDGET_GIB=12
+CUSTOM_MEDIAN_DECODE=13.92 tok/s
+LLAMA_CPP_EXACT_NVFP4_PERFORMANCE=NOT_MEASURABLE
+```
+
+A future engine-to-engine performance comparison remains pending either:
+
+- an upstream fix for the llama.cpp HIP/NVFP4 `MUL_MAT` failure; or
+- a separate practical comparison using another llama.cpp quantization, with
+  the quantization difference stated explicitly.
+```
