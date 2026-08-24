@@ -30,6 +30,9 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
+_ROCM_WARMUP_EMBED_DIAG_ENV = "FREETOKEN_ROCM_WARMUP_EMBED_DIAG"
+_ROCM_WARMUP_EMBED_DIAG_TRUE = {"1", "true", "yes", "on"}
+
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
@@ -165,6 +168,163 @@ def _run_windows_rocm_pre_kv_diagnostic(device: torch.device) -> dict[str, objec
     logger.info_rank0(
         f"ROCm pre-KV diagnostic: current_device_after_probes={current_after}"
     )
+    return state
+
+
+def _raise_warmup_embed_diagnostic_failure(stage: str, exc: BaseException) -> None:
+    message = (
+        f"ROCm warmup-embed diagnostic: {stage}=FAIL "
+        f"type={type(exc).__name__} message={exc}"
+    )
+    logger.warning_rank0(message)
+    raise RuntimeError(message) from exc
+
+
+def _run_windows_rocm_warmup_embed_diagnostic(
+    model,
+    batch: Batch,
+    device: torch.device,
+    length: int,
+) -> dict[str, object] | None:
+    """Compare live PyTorch and FreeToken embedding gathers in the warmup context."""
+
+    enabled = (
+        os.getenv(_ROCM_WARMUP_EMBED_DIAG_ENV, "").strip().lower()
+        in _ROCM_WARMUP_EMBED_DIAG_TRUE
+    )
+    if sys.platform != "win32" or not getattr(torch.version, "hip", None) or not enabled:
+        return None
+
+    inner_model = getattr(model, "model", None)
+    embedding = getattr(inner_model, "embed_tokens", None)
+    weight = getattr(embedding, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        logger.warning_rank0(
+            "ROCm warmup-embed diagnostic: embedding_weight=unavailable action=skip"
+        )
+        return {"skipped": "embedding_weight_unavailable"}
+
+    ids = getattr(batch, "input_ids", None)
+    if not isinstance(ids, torch.Tensor):
+        _raise_warmup_embed_diagnostic_failure(
+            "input_ids", RuntimeError("batch.input_ids is not a tensor")
+        )
+
+    state: dict[str, object] = {
+        "length": int(length),
+        "device": str(device),
+        "weight_shape": tuple(weight.shape),
+        "weight_dtype": str(weight.dtype),
+        "weight_device": str(weight.device),
+        "weight_stride": tuple(weight.stride()),
+        "weight_contiguous": bool(weight.is_contiguous()),
+        "weight_data_ptr": f"0x{int(weight.data_ptr()):x}",
+        "ids_shape": tuple(ids.shape),
+        "ids_dtype": str(ids.dtype),
+        "ids_device": str(ids.device),
+        "ids_contiguous": bool(ids.is_contiguous()),
+        "ids_data_ptr": f"0x{int(ids.data_ptr()):x}",
+    }
+    state["expected_qwen_shape"] = state["weight_shape"] == (248320, 2048)
+    logger.info_rank0(
+        "ROCm warmup-embed diagnostic: "
+        + " ".join(f"{key}={value}" for key, value in state.items())
+    )
+
+    try:
+        from freetoken.kernel.pinned import _load_hip_runtime
+
+        runtime = _load_hip_runtime()
+        if runtime is None:
+            raise RuntimeError("HIP runtime is unavailable")
+        hip_before = int(runtime.hipGetLastError())
+    except Exception as exc:
+        _raise_warmup_embed_diagnostic_failure("hip_last_error_before_probe", exc)
+    state["hip_last_error_before_probe"] = hip_before
+    logger.info_rank0(
+        f"ROCm warmup-embed diagnostic: hip_last_error_before_probe={hip_before}"
+    )
+    if hip_before != 0:
+        _raise_warmup_embed_diagnostic_failure(
+            "hip_last_error_before_probe",
+            RuntimeError(f"unexpected HIP status {hip_before}"),
+        )
+
+    try:
+        torch_output = torch.index_select(weight, 0, ids)
+        torch.cuda.synchronize(device)
+    except Exception as exc:
+        _raise_warmup_embed_diagnostic_failure("torch_index_select", exc)
+    state["torch_index_select"] = "ok"
+    logger.info_rank0("ROCm warmup-embed diagnostic: torch_index_select=ok")
+
+    try:
+        hip_after_torch = int(runtime.hipGetLastError())
+    except Exception as exc:
+        _raise_warmup_embed_diagnostic_failure("hip_after_torch_index_select", exc)
+    state["hip_last_error_after_torch_index_select"] = hip_after_torch
+    logger.info_rank0(
+        "ROCm warmup-embed diagnostic: "
+        f"hip_last_error_after_torch_index_select={hip_after_torch}"
+    )
+    if hip_after_torch != 0:
+        _raise_warmup_embed_diagnostic_failure(
+            "hip_after_torch_index_select",
+            RuntimeError(f"unexpected HIP status {hip_after_torch}"),
+        )
+
+    try:
+        from freetoken.kernel.index import indexing
+
+        ft_output = indexing(weight, ids)
+        torch.cuda.synchronize(device)
+    except Exception as exc:
+        _raise_warmup_embed_diagnostic_failure("freetoken_indexing", exc)
+    state["freetoken_indexing"] = "ok"
+    logger.info_rank0("ROCm warmup-embed diagnostic: freetoken_indexing=ok")
+
+    try:
+        hip_after_ft = int(runtime.hipGetLastError())
+    except Exception as exc:
+        _raise_warmup_embed_diagnostic_failure("hip_after_freetoken_indexing", exc)
+    state["hip_last_error_after_freetoken_indexing"] = hip_after_ft
+    logger.info_rank0(
+        "ROCm warmup-embed diagnostic: "
+        f"hip_last_error_after_freetoken_indexing={hip_after_ft}"
+    )
+    if hip_after_ft != 0:
+        _raise_warmup_embed_diagnostic_failure(
+            "hip_after_freetoken_indexing",
+            RuntimeError(f"unexpected HIP status {hip_after_ft}"),
+        )
+
+    try:
+        outputs_equal = bool(torch.equal(torch_output, ft_output))
+    except Exception as exc:
+        _raise_warmup_embed_diagnostic_failure("output_compare", exc)
+    state["outputs_equal"] = outputs_equal
+    logger.info_rank0(
+        f"ROCm warmup-embed diagnostic: outputs_equal={outputs_equal}"
+    )
+    if not outputs_equal:
+        try:
+            max_abs_diff = float(
+                (torch_output.float() - ft_output.float()).abs().max().item()
+            )
+            logger.warning_rank0(
+                f"ROCm warmup-embed diagnostic: max_abs_diff={max_abs_diff}"
+            )
+        except Exception as metric_exc:
+            logger.warning_rank0(
+                "ROCm warmup-embed diagnostic: max_abs_diff=unavailable "
+                f"type={type(metric_exc).__name__} message={metric_exc}"
+            )
+        _raise_warmup_embed_diagnostic_failure(
+            "output_compare", RuntimeError("embedding outputs differ")
+        )
+
+    state["result"] = "PASS"
+    logger.info_rank0("ROCm warmup-embed diagnostic: PASS")
     return state
 
 
@@ -1020,6 +1180,7 @@ class Engine:
         started = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
         started.record(self.stream)
+        embed_diagnostic_done = False
         try:
             for length in warmup_lens:
                 dummy_row[:length] = torch.arange(
@@ -1041,6 +1202,11 @@ class Engine:
                 batch.out_loc = dummy_row[:length]
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):
+                    if not embed_diagnostic_done:
+                        _run_windows_rocm_warmup_embed_diagnostic(
+                            self.model, batch, self.device, length
+                        )
+                        embed_diagnostic_done = True
                     self.model.forward()
         finally:
             dummy_row.fill_(dummy_slot)
