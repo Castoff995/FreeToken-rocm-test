@@ -47,6 +47,7 @@ RELEASE_REPOS = (
     "ROCm/ROCm",
     "triton-lang/triton-windows",
     "apache/tvm-ffi",
+    "ggml-org/llama.cpp",
 )
 
 DEPENDENCY_SEARCHES = {
@@ -75,6 +76,14 @@ DEPENDENCY_SEARCHES = {
         "gfx1201",
         "Windows ROCm",
         "hipErrorInvalidKernelFile",
+    ),
+    "ggml-org/llama.cpp": (
+        "gfx1201",
+        "Windows HIP",
+        "NVFP4",
+        "Qwen3.6",
+        "MUL_MAT",
+        "ROCm invalid argument",
     ),
 }
 
