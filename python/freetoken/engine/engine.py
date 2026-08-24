@@ -31,7 +31,8 @@ from freetoken.kvcache.linear_state_pool import (
 logger = init_logger(__name__)
 
 _ROCM_WARMUP_EMBED_DIAG_ENV = "FREETOKEN_ROCM_WARMUP_EMBED_DIAG"
-_ROCM_WARMUP_EMBED_DIAG_TRUE = {"1", "true", "yes", "on"}
+_ROCM_LAYER0_DIAG_ENV = "FREETOKEN_ROCM_LAYER0_DIAG"
+_ROCM_DIAG_TRUE = {"1", "true", "yes", "on"}
 
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
@@ -190,7 +191,7 @@ def _run_windows_rocm_warmup_embed_diagnostic(
 
     enabled = (
         os.getenv(_ROCM_WARMUP_EMBED_DIAG_ENV, "").strip().lower()
-        in _ROCM_WARMUP_EMBED_DIAG_TRUE
+        in _ROCM_DIAG_TRUE
     )
     if sys.platform != "win32" or not getattr(torch.version, "hip", None) or not enabled:
         return None
@@ -325,6 +326,219 @@ def _run_windows_rocm_warmup_embed_diagnostic(
 
     state["result"] = "PASS"
     logger.info_rank0("ROCm warmup-embed diagnostic: PASS")
+    return state
+
+
+def _layer0_tensor_metadata(prefix: str, tensor: torch.Tensor) -> dict[str, object]:
+    return {
+        f"{prefix}_shape": tuple(tensor.shape),
+        f"{prefix}_dtype": str(tensor.dtype),
+        f"{prefix}_device": str(tensor.device),
+        f"{prefix}_stride": tuple(tensor.stride()),
+        f"{prefix}_contiguous": bool(tensor.is_contiguous()),
+        f"{prefix}_data_ptr": f"0x{int(tensor.data_ptr()):x}",
+    }
+
+
+def _log_layer0_metadata(state: dict[str, object], *prefixes: str) -> None:
+    suffixes = ("shape", "dtype", "device", "stride", "contiguous", "data_ptr")
+    fields = [
+        f"{prefix}_{suffix}={state[f'{prefix}_{suffix}']}"
+        for prefix in prefixes
+        for suffix in suffixes
+        if f"{prefix}_{suffix}" in state
+    ]
+    logger.info_rank0("ROCm layer0 diagnostic: " + " ".join(fields))
+
+
+def _raise_layer0_diagnostic_failure(
+    stage: str,
+    exc: BaseException,
+    classification: str | None = None,
+) -> None:
+    message = (
+        f"ROCm layer0 diagnostic: {stage}=FAIL "
+        f"type={type(exc).__name__} message={exc}"
+    )
+    logger.warning_rank0(message)
+    if classification is not None:
+        logger.warning_rank0(
+            f"ROCm layer0 diagnostic: CLASSIFICATION={classification}"
+        )
+        message += f" classification={classification}"
+    raise RuntimeError(message) from exc
+
+
+def _layer0_hip_checkpoint(
+    runtime,
+    label: str,
+    classification: str | None = None,
+) -> int:
+    try:
+        status = int(runtime.hipGetLastError())
+    except Exception as exc:
+        _raise_layer0_diagnostic_failure(label, exc, classification)
+    logger.info_rank0(f"ROCm layer0 diagnostic: {label}={status}")
+    if status != 0:
+        _raise_layer0_diagnostic_failure(
+            label,
+            RuntimeError(f"unexpected HIP status {status}"),
+            classification,
+        )
+    return status
+
+
+def _run_windows_rocm_layer0_diagnostic(
+    model,
+    batch: Batch,
+    device: torch.device,
+    length: int,
+) -> dict[str, object] | None:
+    """Classify the first three live Qwen Layer 0 stages during warmup."""
+
+    enabled = (
+        os.getenv(_ROCM_LAYER0_DIAG_ENV, "").strip().lower()
+        in _ROCM_DIAG_TRUE
+    )
+    if sys.platform != "win32" or not getattr(torch.version, "hip", None) or not enabled:
+        return None
+
+    qwen_model = getattr(model, "model", None)
+    embedding = getattr(qwen_model, "embed_tokens", None)
+    layers = getattr(qwen_model, "layers", None)
+    op_list = getattr(layers, "op_list", None)
+    try:
+        layer0 = op_list[0]
+    except (IndexError, TypeError):
+        layer0 = None
+    input_layernorm = getattr(layer0, "input_layernorm", None)
+    gdn = getattr(layer0, "linear_attn", None)
+    qkvz_op = getattr(gdn, "in_proj_qkvz", None)
+    ba_op = getattr(gdn, "in_proj_ba", None)
+    if not all(
+        callable(getattr(op, "forward", None))
+        for op in (embedding, input_layernorm, qkvz_op, ba_op)
+    ):
+        logger.warning_rank0(
+            "ROCm layer0 diagnostic: compatible_layer0=unavailable action=skip"
+        )
+        return {"skipped": "compatible_layer0_unavailable"}
+
+    ids = getattr(batch, "input_ids", None)
+    if not isinstance(ids, torch.Tensor):
+        _raise_layer0_diagnostic_failure(
+            "input_ids", RuntimeError("batch.input_ids is not a tensor")
+        )
+
+    try:
+        from freetoken.kernel.pinned import _load_hip_runtime
+
+        runtime = _load_hip_runtime()
+        if runtime is None:
+            raise RuntimeError("HIP runtime is unavailable")
+    except Exception as exc:
+        _raise_layer0_diagnostic_failure("hip_last_error_before_probe", exc)
+
+    state: dict[str, object] = {
+        "length": int(length),
+        "device": str(device),
+        "_pertensor_fp8": getattr(gdn, "_pertensor_fp8", None),
+        "_block_fp8": getattr(gdn, "_block_fp8", None),
+        "_fp8": getattr(gdn, "_fp8", None),
+    }
+    state["hip_last_error_before_probe"] = _layer0_hip_checkpoint(
+        runtime, "hip_last_error_before_probe"
+    )
+    logger.info_rank0(
+        "ROCm layer0 diagnostic: "
+        f"length={length} device={device} "
+        f"_pertensor_fp8={state['_pertensor_fp8']} "
+        f"_block_fp8={state['_block_fp8']} _fp8={state['_fp8']}"
+    )
+
+    try:
+        hidden = embedding.forward(ids)
+        torch.cuda.synchronize(device)
+        if not isinstance(hidden, torch.Tensor):
+            raise TypeError("embedding output is not a tensor")
+    except Exception as exc:
+        _raise_layer0_diagnostic_failure("embedding_input", exc)
+    state.update(_layer0_tensor_metadata("hidden", hidden))
+    state["expected_qwen_hidden_shape"] = tuple(hidden.shape) == (length, 2048)
+    logger.info_rank0("ROCm layer0 diagnostic: embedding_input=ok")
+    _log_layer0_metadata(state, "hidden")
+    logger.info_rank0(
+        "ROCm layer0 diagnostic: "
+        f"expected_qwen_hidden_shape={state['expected_qwen_hidden_shape']}"
+    )
+    state["hip_last_error_after_embedding_input"] = _layer0_hip_checkpoint(
+        runtime, "hip_last_error_after_embedding_input"
+    )
+
+    try:
+        normed = input_layernorm.forward(hidden)
+        torch.cuda.synchronize(device)
+        if not isinstance(normed, torch.Tensor):
+            raise TypeError("input_layernorm output is not a tensor")
+    except Exception as exc:
+        _raise_layer0_diagnostic_failure("input_layernorm", exc, "L0-A")
+    state.update(_layer0_tensor_metadata("norm", normed))
+    logger.info_rank0("ROCm layer0 diagnostic: input_layernorm=ok")
+    _log_layer0_metadata(state, "norm")
+    state["hip_last_error_after_input_layernorm"] = _layer0_hip_checkpoint(
+        runtime, "hip_last_error_after_input_layernorm", "L0-A"
+    )
+
+    qkvz_metadata: dict[str, object] = {}
+    for name in ("weight", "weight_scale", "weight_scale_inv", "input_scale"):
+        value = getattr(qkvz_op, name, None)
+        if isinstance(value, torch.Tensor):
+            qkvz_metadata.update(_layer0_tensor_metadata(f"qkvz_{name}", value))
+    state.update(qkvz_metadata)
+    if qkvz_metadata:
+        _log_layer0_metadata(
+            state,
+            "qkvz_weight",
+            "qkvz_weight_scale",
+            "qkvz_weight_scale_inv",
+            "qkvz_input_scale",
+        )
+    try:
+        qkvz = qkvz_op.forward(normed)
+        torch.cuda.synchronize(device)
+        if not isinstance(qkvz, torch.Tensor):
+            raise TypeError("in_proj_qkvz output is not a tensor")
+    except Exception as exc:
+        _raise_layer0_diagnostic_failure("in_proj_qkvz", exc, "L0-B")
+    state.update(_layer0_tensor_metadata("qkvz", qkvz))
+    logger.info_rank0("ROCm layer0 diagnostic: in_proj_qkvz=ok")
+    _log_layer0_metadata(state, "qkvz")
+    state["hip_last_error_after_in_proj_qkvz"] = _layer0_hip_checkpoint(
+        runtime, "hip_last_error_after_in_proj_qkvz", "L0-B"
+    )
+
+    ba_weight = getattr(ba_op, "weight", None)
+    if isinstance(ba_weight, torch.Tensor):
+        state.update(_layer0_tensor_metadata("ba_weight", ba_weight))
+        _log_layer0_metadata(state, "ba_weight")
+    try:
+        ba = ba_op.forward(normed)
+        torch.cuda.synchronize(device)
+        if not isinstance(ba, torch.Tensor):
+            raise TypeError("in_proj_ba output is not a tensor")
+    except Exception as exc:
+        _raise_layer0_diagnostic_failure("in_proj_ba", exc, "L0-C")
+    state.update(_layer0_tensor_metadata("ba", ba))
+    logger.info_rank0("ROCm layer0 diagnostic: in_proj_ba=ok")
+    _log_layer0_metadata(state, "ba")
+    state["hip_last_error_after_in_proj_ba"] = _layer0_hip_checkpoint(
+        runtime, "hip_last_error_after_in_proj_ba", "L0-C"
+    )
+
+    state["classification"] = "L0-D"
+    state["result"] = "PASS"
+    logger.info_rank0("ROCm layer0 diagnostic: CLASSIFICATION=L0-D")
+    logger.info_rank0("ROCm layer0 diagnostic: PASS")
     return state
 
 
@@ -1180,7 +1394,7 @@ class Engine:
         started = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
         started.record(self.stream)
-        embed_diagnostic_done = False
+        warmup_diagnostics_done = False
         try:
             for length in warmup_lens:
                 dummy_row[:length] = torch.arange(
@@ -1202,11 +1416,14 @@ class Engine:
                 batch.out_loc = dummy_row[:length]
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):
-                    if not embed_diagnostic_done:
+                    if not warmup_diagnostics_done:
                         _run_windows_rocm_warmup_embed_diagnostic(
                             self.model, batch, self.device, length
                         )
-                        embed_diagnostic_done = True
+                        _run_windows_rocm_layer0_diagnostic(
+                            self.model, batch, self.device, length
+                        )
+                        warmup_diagnostics_done = True
                     self.model.forward()
         finally:
             dummy_row.fill_(dummy_slot)
