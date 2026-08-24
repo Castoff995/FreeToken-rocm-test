@@ -36,6 +36,17 @@ class HostMappingResult:
         return self.device_ptr is not None and self.device_ptr > 0
 
 
+class _HipHostRegisterError(RuntimeError):
+    """Direct HIP registration failure, retained until its caller chooses policy."""
+
+    def __init__(self, runtime, nbytes: int, status: int):
+        super().__init__(
+            f"hipHostRegister({nbytes} bytes) failed with hipError {status}"
+        )
+        self.runtime = runtime
+        self.status = status
+
+
 @lru_cache(maxsize=1)
 def _load_pinned_extension():
     try:
@@ -49,6 +60,8 @@ def _load_pinned_extension():
 def _configure_hip_runtime(runtime):
     """Set exact ctypes signatures for the HIP host-mapping APIs we call."""
 
+    runtime.hipGetLastError.argtypes = []
+    runtime.hipGetLastError.restype = ctypes.c_int
     runtime.hipHostRegister.argtypes = [
         ctypes.c_void_p,
         ctypes.c_size_t,
@@ -110,6 +123,23 @@ def _hip_host_register(runtime, addr: int, nbytes: int) -> int:
             ctypes.c_uint(_HIP_HOST_REGISTER_FLAGS),
         )
     )
+
+
+def _clear_recoverable_hip_host_register_error(error: BaseException) -> int | None:
+    """Clear a direct registration error only after its caller accepts fallback.
+
+    ``HostBank.pin`` adds context around the direct runtime exception, so inspect the
+    explicit cause chain. Returning ``None`` means the error did not originate from
+    our ctypes ``hipHostRegister`` call and no HIP state was touched.
+    """
+
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, _HipHostRegisterError):
+            current.runtime.hipGetLastError()
+            return current.status
+        current = current.__cause__
+    return None
 
 
 def _hip_host_device_ptr(runtime, addr: int) -> int:
@@ -246,9 +276,7 @@ def host_register(addr: int, nbytes: int) -> None:
             raise RuntimeError("HIP runtime host-mapping APIs are unavailable")
         status = _hip_host_register(runtime, addr, nbytes)
         if status != 0:
-            raise RuntimeError(
-                f"hipHostRegister({nbytes} bytes) failed with hipError {status}"
-            )
+            raise _HipHostRegisterError(runtime, nbytes, status)
 
 
 @lru_cache(maxsize=1)

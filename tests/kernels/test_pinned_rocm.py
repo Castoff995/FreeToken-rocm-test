@@ -23,6 +23,7 @@ def _clear_pinned_caches():
 
 def _runtime(*, register_status: int = 0, mapped_ptr: int = 0xABCDEF00):
     runtime = SimpleNamespace()
+    runtime.hipGetLastError = mock.Mock(return_value=register_status)
     runtime.hipHostRegister = mock.Mock(return_value=register_status)
 
     def get_device_pointer(output, _host, _flags):
@@ -71,6 +72,8 @@ def test_hip_function_signatures_are_configured_explicitly():
     runtime = _runtime()
 
     assert pinned._configure_hip_runtime(runtime) is runtime
+    assert runtime.hipGetLastError.argtypes == []
+    assert runtime.hipGetLastError.restype is ctypes.c_int
     assert runtime.hipHostRegister.argtypes == [
         ctypes.c_void_p,
         ctypes.c_size_t,
@@ -102,6 +105,7 @@ def test_hip_registration_uses_portable_and_mapped_flags():
     assert flags.value == (
         pinned._HIP_HOST_REGISTER_PORTABLE | pinned._HIP_HOST_REGISTER_MAPPED
     )
+    runtime.hipGetLastError.assert_not_called()
 
 
 def test_zero_byte_registration_is_rejected_without_calling_hip():
@@ -125,6 +129,22 @@ def test_hip_registration_failure_is_surfaced():
         pytest.raises(RuntimeError, match="hipError 17"),
     ):
         pinned.host_register(0x12340000, 4096)
+    runtime.hipGetLastError.assert_not_called()
+
+
+def test_direct_registration_failure_can_be_cleared_without_losing_status():
+    runtime = _runtime(register_status=17)
+    with (
+        mock.patch.object(pinned, "_load_pinned_extension", return_value=None),
+        mock.patch.object(pinned, "_load_hip_runtime", return_value=runtime),
+        mock.patch.object(torch.version, "hip", "test-rocm"),
+        pytest.raises(RuntimeError, match="hipError 17") as failure,
+    ):
+        pinned.host_register(0x12340000, 4096)
+
+    assert pinned._clear_recoverable_hip_host_register_error(failure.value) == 17
+    runtime.hipGetLastError.assert_called_once_with()
+    assert "hipError 17" in str(failure.value)
 
 
 def test_hip_mapping_returns_translated_nonidentity_pointer():

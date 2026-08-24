@@ -223,6 +223,21 @@ class PinPipeline:
                 self._mapped_count += 1
             except BaseException as exc:  # surfaced by wait()/__exit__
                 if _windows_rocm_pageable_fallback() and isinstance(exc, RuntimeError):
+                    from freetoken.kernel.pinned import (
+                        _clear_recoverable_hip_host_register_error,
+                    )
+
+                    # A failed direct ctypes hipHostRegister leaves HIP's last-error
+                    # state sticky. Clear only here, where that exact failure is being
+                    # accepted as a Windows ROCm pageable fallback. The original status
+                    # remains embedded in ``exc`` for the warning below.
+                    try:
+                        _clear_recoverable_hip_host_register_error(exc)
+                    except BaseException as clear_exc:
+                        # Continuing would let the next otherwise-valid PyTorch call
+                        # surface the uncleared HIP error with a misleading traceback.
+                        self._exc = clear_exc
+                        continue
                     # Windows/WDDM may reject an individual hipHostRegister even after
                     # earlier banks succeeded. Keep this bank as ordinary host memory;
                     # residency-aware cache dispatch will stage its whole layer through
