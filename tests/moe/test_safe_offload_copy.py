@@ -7,13 +7,13 @@ from unittest import mock
 
 import torch
 
+from freetoken.kernel.pinned import HostMappingResult
 from freetoken.moe import decode_trace
 from freetoken.moe.offload_cache import SAFE_OFFLOAD_COPY_ENV, OffloadMoeCache
 
 
-class _MappedExtension:
-    def host_device_ptr(self, host_ptr: int) -> int:
-        return host_ptr + 0x1000
+def _mapped(host_ptr: int) -> HostMappingResult:
+    return HostMappingResult(host_ptr + 0x1000, "hip_runtime", False, "ok")
 
 
 def _cache() -> OffloadMoeCache:
@@ -29,7 +29,9 @@ def _cache() -> OffloadMoeCache:
     down = torch.stack(
         [torch.full((3, 2), 10 + expert, dtype=torch.float32) for expert in range(4)]
     )
-    cache.set_bank_sources({"gate_up": [gate_up], "down": [down]})
+    # Building a CPU fixture must never discover or call an installed HIP runtime.
+    with mock.patch.object(torch.version, "hip", None):
+        cache.set_bank_sources({"gate_up": [gate_up], "down": [down]})
     cache._pending_src_layer = 0
     return cache
 
@@ -51,7 +53,12 @@ class SafeOffloadCopyTests(unittest.TestCase):
             mock.patch.dict(os.environ, {SAFE_OFFLOAD_COPY_ENV: ""}),
             mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
             mock.patch.object(torch.version, "hip", "test-rocm"),
-            mock.patch("freetoken.kernel.pinned._load_pinned_extension", return_value=None),
+            mock.patch(
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                return_value=HostMappingResult(
+                    None, "unavailable", False, "mapping_backend_unavailable"
+                ),
+            ),
         ):
             self.assertTrue(cache.should_use_safe_offload_copy(0))
 
@@ -62,8 +69,8 @@ class SafeOffloadCopyTests(unittest.TestCase):
             mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
             mock.patch.object(torch.version, "hip", "test-rocm"),
             mock.patch(
-                "freetoken.kernel.pinned._load_pinned_extension",
-                side_effect=OSError("extension dependency unavailable"),
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                side_effect=OSError("mapping backend unavailable"),
             ),
         ):
             self.assertTrue(cache.should_use_safe_offload_copy(0))
@@ -75,8 +82,8 @@ class SafeOffloadCopyTests(unittest.TestCase):
             mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
             mock.patch.object(torch.version, "hip", "test-rocm"),
             mock.patch(
-                "freetoken.kernel.pinned._load_pinned_extension",
-                return_value=_MappedExtension(),
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                side_effect=_mapped,
             ),
             mock.patch.object(cache, "_copy_missing_safe") as safe_copy,
             mock.patch("freetoken.kernel.fast_index_copy_jit") as fast_copy,
@@ -94,12 +101,12 @@ class SafeOffloadCopyTests(unittest.TestCase):
             mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
             mock.patch.object(torch.version, "hip", "test-rocm"),
             mock.patch(
-                "freetoken.kernel.pinned._load_pinned_extension",
+                "freetoken.kernel.pinned.resolve_host_mapping",
                 side_effect=AssertionError("force override must not inspect mapping"),
-            ) as loader,
+            ) as resolver,
         ):
             self.assertTrue(cache.should_use_safe_offload_copy(0))
-        loader.assert_not_called()
+        resolver.assert_not_called()
 
     def test_nvidia_keeps_existing_fast_path(self):
         cache = _cache()
@@ -117,7 +124,12 @@ class SafeOffloadCopyTests(unittest.TestCase):
             mock.patch.dict(os.environ, {SAFE_OFFLOAD_COPY_ENV: ""}),
             mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
             mock.patch.object(torch.version, "hip", "test-rocm"),
-            mock.patch("freetoken.kernel.pinned._load_pinned_extension", return_value=None),
+            mock.patch(
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                return_value=HostMappingResult(
+                    None, "unavailable", False, "mapping_backend_unavailable"
+                ),
+            ),
             mock.patch.object(cache, "_copy_missing_safe") as safe_copy,
         ):
             cache.copy_missing()
@@ -137,6 +149,22 @@ class SafeOffloadCopyTests(unittest.TestCase):
 
         safe_copy.assert_not_called()
         self.assertEqual(fast_copy.call_count, len(cache.banks))
+
+    def test_mapping_result_is_cached_per_layer(self):
+        cache = _cache()
+        with (
+            mock.patch.dict(os.environ, {SAFE_OFFLOAD_COPY_ENV: ""}),
+            mock.patch("freetoken.moe.offload_cache.sys.platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            mock.patch(
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                side_effect=_mapped,
+            ) as resolver,
+        ):
+            self.assertFalse(cache.should_use_safe_offload_copy(0))
+            self.assertFalse(cache.should_use_safe_offload_copy(0))
+
+        self.assertEqual(resolver.call_count, len(cache.bank_schema))
 
     def test_safe_copy_plan_preserves_staged_lru_pairs(self):
         cache = _cache()

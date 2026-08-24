@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 
+from freetoken.kernel.pinned import HostMappingResult
 from freetoken.moe import decode_trace
 
 
@@ -23,9 +24,8 @@ def _host_cache(*sources: torch.Tensor):
     )
 
 
-class _MappedExtension:
-    def host_device_ptr(self, host_ptr: int) -> int:
-        return host_ptr + 0x1000
+def _mapped(host_ptr: int) -> HostMappingResult:
+    return HostMappingResult(host_ptr + 0x1000, "hip_runtime", False, "ok")
 
 
 class DecodeTraceTests(unittest.TestCase):
@@ -137,33 +137,8 @@ class DecodeTraceTests(unittest.TestCase):
 
         self.assertEqual(calls, [])
 
-    def test_host_mapping_preflight_extension_missing_is_unsafe(self):
+    def test_host_mapping_preflight_backend_unavailable_is_unsafe(self):
         cache = _host_cache(torch.empty(4, dtype=torch.uint8))
-        output = io.StringIO()
-        with (
-            mock.patch.dict(os.environ, {decode_trace.TRACE_ENV: "1"}),
-            mock.patch.object(decode_trace, "_stream_fields", return_value={"stream": "test"}),
-            mock.patch.object(decode_trace.sys, "platform", "win32"),
-            mock.patch.object(torch.version, "hip", "test-rocm"),
-            mock.patch("freetoken.kernel.pinned._load_pinned_extension", return_value=None),
-            redirect_stderr(output),
-        ):
-            self.assertTrue(decode_trace.begin_first_decode(_batch("decode")))
-            with self.assertRaisesRegex(RuntimeError, "pinned_extension_missing"):
-                decode_trace.preflight_windows_rocm_host_mapping(cache, 0)
-
-        marker = next(
-            line for line in output.getvalue().splitlines() if "stage=host_mapping_preflight" in line
-        )
-        self.assertIn("pinned_extension_loaded=false", marker)
-        self.assertIn("device_ptr=unavailable", marker)
-        self.assertIn("safe_for_gpu_deref=false", marker)
-        self.assertIn("reason=pinned_extension_missing", marker)
-
-    def test_host_mapping_preflight_unavailable_mapping_is_unsafe(self):
-        cache = _host_cache(torch.empty(4, dtype=torch.uint8))
-        extension = mock.Mock()
-        extension.host_device_ptr.side_effect = RuntimeError("not registered")
         output = io.StringIO()
         with (
             mock.patch.dict(os.environ, {decode_trace.TRACE_ENV: "1"}),
@@ -171,7 +146,39 @@ class DecodeTraceTests(unittest.TestCase):
             mock.patch.object(decode_trace.sys, "platform", "win32"),
             mock.patch.object(torch.version, "hip", "test-rocm"),
             mock.patch(
-                "freetoken.kernel.pinned._load_pinned_extension", return_value=extension
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                return_value=HostMappingResult(
+                    None, "unavailable", False, "mapping_backend_unavailable"
+                ),
+            ),
+            redirect_stderr(output),
+        ):
+            self.assertTrue(decode_trace.begin_first_decode(_batch("decode")))
+            with self.assertRaisesRegex(RuntimeError, "mapping_backend_unavailable"):
+                decode_trace.preflight_windows_rocm_host_mapping(cache, 0)
+
+        marker = next(
+            line for line in output.getvalue().splitlines() if "stage=host_mapping_preflight" in line
+        )
+        self.assertIn("pinned_extension_loaded=false", marker)
+        self.assertIn("mapping_backend=unavailable", marker)
+        self.assertIn("device_ptr=unavailable", marker)
+        self.assertIn("safe_for_gpu_deref=false", marker)
+        self.assertIn("reason=mapping_backend_unavailable", marker)
+
+    def test_host_mapping_preflight_unavailable_mapping_is_unsafe(self):
+        cache = _host_cache(torch.empty(4, dtype=torch.uint8))
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {decode_trace.TRACE_ENV: "1"}),
+            mock.patch.object(decode_trace, "_stream_fields", return_value={"stream": "test"}),
+            mock.patch.object(decode_trace.sys, "platform", "win32"),
+            mock.patch.object(torch.version, "hip", "test-rocm"),
+            mock.patch(
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                return_value=HostMappingResult(
+                    None, "unavailable", True, "host_device_mapping_failed"
+                ),
             ),
             redirect_stderr(output),
         ):
@@ -200,8 +207,8 @@ class DecodeTraceTests(unittest.TestCase):
             mock.patch.object(decode_trace.sys, "platform", "win32"),
             mock.patch.object(torch.version, "hip", "test-rocm"),
             mock.patch(
-                "freetoken.kernel.pinned._load_pinned_extension",
-                return_value=_MappedExtension(),
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                side_effect=_mapped,
             ),
             redirect_stderr(output),
         ):
@@ -213,6 +220,7 @@ class DecodeTraceTests(unittest.TestCase):
         )
         self.assertIn("bank_count=2", marker)
         self.assertIn("mapped_bank_count=2", marker)
+        self.assertIn("mapping_backend=hip_runtime", marker)
         self.assertIn(f"host_ptr={hex(sources[0].data_ptr())}", marker)
         self.assertIn(f"device_ptr={hex(sources[0].data_ptr() + 0x1000)}", marker)
         self.assertIn("safe_for_gpu_deref=true", marker)
@@ -225,16 +233,16 @@ class DecodeTraceTests(unittest.TestCase):
             mock.patch.object(decode_trace.sys, "platform", "win32"),
             mock.patch.object(torch.version, "hip", "test-rocm"),
             mock.patch(
-                "freetoken.kernel.pinned._load_pinned_extension",
-                side_effect=AssertionError("extension loader must remain untouched"),
-            ) as loader,
+                "freetoken.kernel.pinned.resolve_host_mapping",
+                side_effect=AssertionError("mapping resolver must remain untouched"),
+            ) as resolver,
             redirect_stderr(output),
         ):
             self.assertFalse(
                 decode_trace.preflight_windows_rocm_host_mapping(object(), layer_id=0)
             )
 
-        loader.assert_not_called()
+        resolver.assert_not_called()
         self.assertEqual(output.getvalue(), "")
 
 

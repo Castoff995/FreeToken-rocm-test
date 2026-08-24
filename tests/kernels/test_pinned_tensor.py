@@ -111,11 +111,11 @@ def test_device_ptr_cuda_tensor_passthrough():
     assert device_ptr(t) == t.data_ptr()
 
 
-def test_host_device_ptr_is_identity_under_uva():
+def test_host_device_mapping_is_identity_under_uva():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
 
-    from freetoken.kernel.pinned import _host_ptr_identity, _load_pinned_extension
+    from freetoken.kernel.pinned import _host_ptr_identity, resolve_host_mapping
 
     torch.cuda.init()
     if not _host_ptr_identity():
@@ -124,15 +124,16 @@ def test_host_device_ptr_is_identity_under_uva():
     # (no registration validation); rejection of pageable memory only exists on
     # non-identity platforms (Windows/WDDM), where the translation is real.
     pageable = torch.empty(64, dtype=torch.uint8)
-    ext = _load_pinned_extension()
-    assert ext.host_device_ptr(pageable.data_ptr()) == pageable.data_ptr()
+    mapping = resolve_host_mapping(pageable.data_ptr())
+    assert mapping.available
+    assert mapping.device_ptr == pageable.data_ptr()
 
 
 def test_host_bank_pin_registers_and_translates():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
 
-    from freetoken.kernel.pinned import _host_ptr_identity, _load_pinned_extension
+    from freetoken.kernel.pinned import _host_ptr_identity, resolve_host_mapping
     from freetoken.moe.host_banks import HostBank
 
     bank = HostBank((4, 32), torch.bfloat16)
@@ -140,7 +141,9 @@ def test_host_bank_pin_registers_and_translates():
     bank.pin()
     bank.pin()  # idempotent
     # registered+mapped memory must have a device alias
-    dev = _load_pinned_extension().host_device_ptr(bank.addr)
+    mapping = resolve_host_mapping(bank.addr)
+    assert mapping.available
+    dev = mapping.device_ptr
     if _host_ptr_identity():
         assert dev == bank.addr
     else:

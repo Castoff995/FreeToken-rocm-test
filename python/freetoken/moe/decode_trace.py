@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -35,6 +35,7 @@ _state = _TraceState()
 class _HostMappingStatus:
     safe_for_gpu_deref: bool
     pinned_extension_loaded: bool
+    mapping_backend: str
     host_bank_residency: str
     bank_count: int
     mapped_bank_count: int
@@ -206,7 +207,7 @@ def cache_hit_miss_counts(
 def _inspect_host_mapping(
     cache: Any,
     layer_id: int,
-    extension: Any | None,
+    resolver: Any,
 ) -> _HostMappingStatus:
     """Prove that each current host bank has a HIP-visible device mapping."""
 
@@ -217,7 +218,7 @@ def _inspect_host_mapping(
         pass
 
     bank_names = tuple(getattr(cache, "bank_schema", ()))
-    sources: list[tuple[str, torch.Tensor]] = []
+    sources: list[tuple[str, Any]] = []
     failed_bank = "none"
     reason = "ok"
     for name in bank_names:
@@ -237,119 +238,97 @@ def _inspect_host_mapping(
             reason = "host_pointer_unavailable"
             failed_bank = sources[0][0]
 
-    if extension is None:
-        return _HostMappingStatus(
-            False,
-            False,
-            residency,
-            len(bank_names),
-            0,
-            first_host_ptr,
-            "unavailable",
-            failed_bank if failed_bank != "none" else (sources[0][0] if sources else "none"),
-            "pinned_extension_missing",
-        )
-
-    host_device_ptr = getattr(extension, "host_device_ptr", None)
-    if not callable(host_device_ptr):
-        return _HostMappingStatus(
-            False,
-            True,
-            residency,
-            len(bank_names),
-            0,
-            first_host_ptr,
-            "unavailable",
-            failed_bank if failed_bank != "none" else (sources[0][0] if sources else "none"),
-            "host_device_ptr_unavailable",
-        )
-
     if reason != "ok" or len(sources) != len(bank_names) or not sources:
         return _HostMappingStatus(
-            False,
-            True,
-            residency,
-            len(bank_names),
-            0,
-            first_host_ptr,
-            "unavailable",
-            failed_bank,
-            reason if reason != "ok" else "host_bank_source_unavailable",
+            safe_for_gpu_deref=False,
+            pinned_extension_loaded=False,
+            mapping_backend="unavailable",
+            host_bank_residency=residency,
+            bank_count=len(bank_names),
+            mapped_bank_count=0,
+            host_ptr=first_host_ptr,
+            device_ptr="unavailable",
+            failed_bank=failed_bank,
+            reason=reason if reason != "ok" else "host_bank_source_unavailable",
         )
 
     mapped_bank_count = 0
     first_device_ptr = "unavailable"
+    extension_loaded = False
+    mapping_backend = "unavailable"
     for name, source in sources:
         if not isinstance(source, torch.Tensor) or source.device.type != "cpu":
             return _HostMappingStatus(
-                False,
-                True,
-                residency,
-                len(bank_names),
-                mapped_bank_count,
-                first_host_ptr,
-                first_device_ptr,
-                name,
-                "host_bank_source_not_cpu",
+                safe_for_gpu_deref=False,
+                pinned_extension_loaded=extension_loaded,
+                mapping_backend=mapping_backend,
+                host_bank_residency=residency,
+                bank_count=len(bank_names),
+                mapped_bank_count=mapped_bank_count,
+                host_ptr=first_host_ptr,
+                device_ptr=first_device_ptr,
+                failed_bank=name,
+                reason="host_bank_source_not_cpu",
             )
         try:
-            mapped_ptr = int(host_device_ptr(int(source.data_ptr())))
+            result = resolver(int(source.data_ptr()))
         except Exception:
             return _HostMappingStatus(
-                False,
-                True,
-                residency,
-                len(bank_names),
-                mapped_bank_count,
-                first_host_ptr,
-                first_device_ptr,
-                name,
-                "host_device_mapping_failed",
+                safe_for_gpu_deref=False,
+                pinned_extension_loaded=extension_loaded,
+                mapping_backend=mapping_backend,
+                host_bank_residency=residency,
+                bank_count=len(bank_names),
+                mapped_bank_count=mapped_bank_count,
+                host_ptr=first_host_ptr,
+                device_ptr=first_device_ptr,
+                failed_bank=name,
+                reason="host_device_mapping_failed",
             )
-        if mapped_ptr == 0:
+        extension_loaded = extension_loaded or bool(result.extension_loaded)
+        result_backend = str(result.mapping_backend)
+        if mapping_backend == "unavailable":
+            mapping_backend = result_backend
+        elif result_backend != mapping_backend:
+            mapping_backend = "mixed"
+        if not result.available:
             return _HostMappingStatus(
-                False,
-                True,
-                residency,
-                len(bank_names),
-                mapped_bank_count,
-                first_host_ptr,
-                first_device_ptr,
-                name,
-                "host_device_pointer_zero",
+                safe_for_gpu_deref=False,
+                pinned_extension_loaded=extension_loaded,
+                mapping_backend=mapping_backend,
+                host_bank_residency=residency,
+                bank_count=len(bank_names),
+                mapped_bank_count=mapped_bank_count,
+                host_ptr=first_host_ptr,
+                device_ptr=first_device_ptr,
+                failed_bank=name,
+                reason=str(result.reason),
             )
+        mapped_ptr = int(result.device_ptr)
         mapped_bank_count += 1
         if first_device_ptr == "unavailable":
             first_device_ptr = hex(mapped_ptr)
 
     return _HostMappingStatus(
-        True,
-        True,
-        residency,
-        len(bank_names),
-        mapped_bank_count,
-        first_host_ptr,
-        first_device_ptr,
-        "none",
-        "ok",
+        safe_for_gpu_deref=True,
+        pinned_extension_loaded=extension_loaded,
+        mapping_backend=mapping_backend,
+        host_bank_residency=residency,
+        bank_count=len(bank_names),
+        mapped_bank_count=mapped_bank_count,
+        host_ptr=first_host_ptr,
+        device_ptr=first_device_ptr,
+        failed_bank="none",
+        reason="ok",
     )
 
 
 def inspect_host_mapping(cache: Any, layer_id: int) -> _HostMappingStatus:
-    """Inspect current bank mappings using the packaged pinned-memory extension."""
+    """Inspect current banks through the best available host-mapping backend."""
 
-    from freetoken.kernel.pinned import _load_pinned_extension
+    from freetoken.kernel.pinned import resolve_host_mapping
 
-    try:
-        extension = _load_pinned_extension()
-    except Exception:
-        # Capability detection must fail closed: a broken/unloadable extension is not
-        # evidence that a Windows host VA is safe for direct GPU dereference.
-        return replace(
-            _inspect_host_mapping(cache, layer_id, None),
-            reason="pinned_extension_load_failed",
-        )
-    return _inspect_host_mapping(cache, layer_id, extension)
+    return _inspect_host_mapping(cache, layer_id, resolve_host_mapping)
 
 
 def preflight_windows_rocm_host_mapping(
@@ -369,6 +348,7 @@ def preflight_windows_rocm_host_mapping(
         platform="windows",
         rocm="true",
         pinned_extension_loaded=str(status.pinned_extension_loaded).lower(),
+        mapping_backend=status.mapping_backend,
         host_bank_residency=status.host_bank_residency,
         bank_count=status.bank_count,
         mapped_bank_count=status.mapped_bank_count,

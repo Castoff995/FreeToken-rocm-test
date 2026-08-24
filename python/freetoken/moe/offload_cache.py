@@ -355,7 +355,13 @@ class OffloadMoeCache:
                 # The kernel dereferences these on the GPU, so store each host bank's
                 # device alias (== data_ptr() under UVA identity; differs on
                 # Windows/WDDM).
-                src_dev = device_ptr(source)
+                try:
+                    src_dev = device_ptr(source)
+                except RuntimeError:
+                    # A missing mapping is not fatal on Windows ROCm: decode capability
+                    # inspection will select the staged PyTorch H2D fallback. Leave the
+                    # fused pointer plan disabled rather than storing a raw CPU VA.
+                    return
                 if src_dev % 16 != 0:
                     return
                 layer_src_ptrs[layer_id].append(src_dev)

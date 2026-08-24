@@ -89,7 +89,7 @@ class HostBank:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
             raise RuntimeError(
-                f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
+                f"host registration failed for {len(self._buf) / 2**30:.1f} GiB"
             ) from exc
         self._pinned = True
 
