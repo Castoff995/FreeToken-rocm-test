@@ -1,0 +1,44 @@
+name: FreeToken ROCm Watch
+
+on:
+  schedule:
+    # GitHub cron uses UTC. Minute 17 avoids the busiest top-of-hour window.
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/freetoken-rocm-watch.yml
+      - .github/scripts/freetoken_rocm_watch.py
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: read
+
+concurrency:
+  group: freetoken-rocm-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out monitoring code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check FreeToken and ROCm ecosystem
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WATCH_PR_NUMBER: "1"
+          WATCH_MENTION: "Castoff995"
+          PYTHONUNBUFFERED: "1"
+        run: python .github/scripts/freetoken_rocm_watch.py
