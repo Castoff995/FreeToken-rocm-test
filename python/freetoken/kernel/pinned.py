@@ -11,6 +11,7 @@ import ctypes
 import importlib
 import mmap
 import os
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -42,6 +43,17 @@ class _HipHostRegisterError(RuntimeError):
     def __init__(self, runtime, nbytes: int, status: int):
         super().__init__(
             f"hipHostRegister({nbytes} bytes) failed with hipError {status}"
+        )
+        self.runtime = runtime
+        self.status = status
+
+
+class _HipHostDevicePointerError(RuntimeError):
+    """Direct HIP mapping failure, retained until its caller chooses policy."""
+
+    def __init__(self, runtime, status: int):
+        super().__init__(
+            f"hipHostGetDevicePointer failed with hipError {status}"
         )
         self.runtime = runtime
         self.status = status
@@ -152,7 +164,7 @@ def _hip_host_device_ptr(runtime, addr: int) -> int:
         )
     )
     if status != 0:
-        raise RuntimeError(f"hipHostGetDevicePointer failed with hipError {status}")
+        raise _HipHostDevicePointerError(runtime, status)
     if not mapped.value:
         raise RuntimeError("hipHostGetDevicePointer returned a null device pointer")
     return int(mapped.value)
@@ -217,6 +229,18 @@ def resolve_host_mapping(addr: int) -> HostMappingResult:
         return HostMappingResult(None, "unavailable", False, reason)
     try:
         mapped = _hip_host_device_ptr(runtime, addr)
+    except _HipHostDevicePointerError as exc:
+        if sys.platform == "win32" and bool(getattr(torch.version, "hip", None)):
+            # Only this Windows ROCm boundary intentionally converts a failed direct
+            # ctypes mapping call into a nonfatal capability result. Clear its sticky
+            # HIP state before PyTorch runs again; the typed exception retains status.
+            exc.runtime.hipGetLastError()
+        return HostMappingResult(
+            None,
+            "unavailable",
+            False,
+            "host_device_mapping_failed",
+        )
     except Exception:
         return HostMappingResult(
             None,

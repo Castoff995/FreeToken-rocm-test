@@ -160,6 +160,7 @@ def test_hip_mapping_returns_translated_nonidentity_pointer():
     assert result.device_ptr != 0x12340000
     assert result.mapping_backend == "hip_runtime"
     assert not result.extension_loaded
+    runtime.hipGetLastError.assert_not_called()
 
 
 def test_mapping_failure_never_proves_raw_host_pointer():
@@ -169,6 +170,8 @@ def test_mapping_failure_never_proves_raw_host_pointer():
     with (
         mock.patch.object(pinned, "_load_pinned_extension", return_value=None),
         mock.patch.object(pinned, "_load_hip_runtime", return_value=runtime),
+        mock.patch("freetoken.kernel.pinned.sys.platform", "win32"),
+        mock.patch.object(torch.version, "hip", "test-rocm"),
     ):
         result = pinned.resolve_host_mapping(host_ptr)
 
@@ -177,6 +180,71 @@ def test_mapping_failure_never_proves_raw_host_pointer():
     assert result.device_ptr != host_ptr
     assert result.mapping_backend == "unavailable"
     assert result.reason == "host_device_mapping_failed"
+    runtime.hipGetLastError.assert_called_once_with()
+
+
+def test_direct_mapping_failure_preserves_runtime_and_status():
+    runtime = _runtime()
+    runtime.hipHostGetDevicePointer.side_effect = lambda *_args: 11
+
+    with pytest.raises(pinned._HipHostDevicePointerError) as failure:
+        pinned._hip_host_device_ptr(runtime, 0x12340000)
+
+    assert failure.value.runtime is runtime
+    assert failure.value.status == 11
+    assert "hipError 11" in str(failure.value)
+    runtime.hipGetLastError.assert_not_called()
+
+
+def test_arbitrary_mapping_exception_does_not_clear_hip_error():
+    runtime = _runtime()
+    runtime.hipHostGetDevicePointer.side_effect = RuntimeError("unrelated failure")
+    with (
+        mock.patch.object(pinned, "_load_pinned_extension", return_value=None),
+        mock.patch.object(pinned, "_load_hip_runtime", return_value=runtime),
+        mock.patch("freetoken.kernel.pinned.sys.platform", "win32"),
+        mock.patch.object(torch.version, "hip", "test-rocm"),
+    ):
+        result = pinned.resolve_host_mapping(0x12340000)
+
+    assert not result.available
+    assert result.reason == "host_device_mapping_failed"
+    runtime.hipGetLastError.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("platform", "hip_version"),
+    [("linux", "test-rocm"), ("win32", None)],
+)
+def test_mapping_fallback_does_not_clear_outside_windows_rocm(platform, hip_version):
+    runtime = _runtime()
+    runtime.hipHostGetDevicePointer.side_effect = lambda *_args: 11
+    with (
+        mock.patch.object(pinned, "_load_pinned_extension", return_value=None),
+        mock.patch.object(pinned, "_load_hip_runtime", return_value=runtime),
+        mock.patch("freetoken.kernel.pinned.sys.platform", platform),
+        mock.patch.object(torch.version, "hip", hip_version),
+    ):
+        result = pinned.resolve_host_mapping(0x12340000)
+
+    assert not result.available
+    runtime.hipGetLastError.assert_not_called()
+
+
+def test_mapping_fallback_does_not_continue_when_error_clear_fails():
+    runtime = _runtime()
+    runtime.hipHostGetDevicePointer.side_effect = lambda *_args: 11
+    runtime.hipGetLastError.side_effect = RuntimeError("clear failed")
+    with (
+        mock.patch.object(pinned, "_load_pinned_extension", return_value=None),
+        mock.patch.object(pinned, "_load_hip_runtime", return_value=runtime),
+        mock.patch("freetoken.kernel.pinned.sys.platform", "win32"),
+        mock.patch.object(torch.version, "hip", "test-rocm"),
+        pytest.raises(RuntimeError, match="clear failed"),
+    ):
+        pinned.resolve_host_mapping(0x12340000)
+
+    runtime.hipGetLastError.assert_called_once_with()
 
 
 def test_device_ptr_raises_instead_of_returning_raw_pointer_on_rocm_failure():
