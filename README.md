@@ -70,6 +70,25 @@ This fork brings FreeToken up on **Windows 11 + AMD ROCm** with no NVIDIA toolch
 Bring-up target: RX 9070 XT (`gfx1201`). Everything below was verified live: model load,
 prefill, decode (~57 tok/s bf16 3B), SSE token streaming, and the bundled mini web UI.
 
+## Windows ROCm / RDNA4 status
+
+Validated custom Windows ROCm build on AMD Radeon RX 9070 XT (`gfx1201`):
+
+- Qwen3.6 E2E serving: PASS
+- ROCm 7.13
+- TP=1
+- Validated pin budget: 12 GiB
+- Pinned: 11.854 GiB
+- Fast mapped layers: 28/40
+- Safe-copy layers: 12/40
+- Median decode: 13.92 tok/s
+- Median TTFT: 1187.6 ms
+- TDR / driver reset: NO / NO
+
+[Full Windows gfx1201 benchmark and validation report](docs/benchmarks/windows-gfx1201-qwen36.md)
+
+This is a custom Windows ROCm/gfx1201 build validated on one RX 9070 XT system; it is not official FlashML or AMD support.
+
 ### Measured performance (RX 9070 XT, Windows, stock settings)
 
 | Model | Precision | Fit | Decode speed | Notes |
