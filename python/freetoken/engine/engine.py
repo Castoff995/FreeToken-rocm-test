@@ -896,30 +896,50 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
 
-    def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
-            torch.distributed.init_process_group(
+    def _init_communication(self, config: EngineConfig) -> Any | None:
+        # A one-rank tensor partition is the full tensor: collectives are identities,
+        # memory extrema are local values, and scheduler barriers have no peers. Keep
+        # TP=1 independent of torch.distributed so official Windows ROCm builds without
+        # Gloo can run; TP>1 retains the existing process-group implementations below.
+        if config.tp_info.size == 1:
+            return None
+
+        dist = getattr(torch, "distributed", None)
+        if (
+            dist is None
+            or not callable(getattr(dist, "is_available", None))
+            or not dist.is_available()
+            or not callable(getattr(dist, "init_process_group", None))
+        ):
+            raise RuntimeError(
+                "tensor parallel size > 1 requires PyTorch distributed support "
+                "(torch.distributed with init_process_group), but this PyTorch build "
+                "does not provide it"
+            )
+
+        if config.use_pynccl:
+            dist.init_process_group(
                 backend="gloo",
                 rank=config.tp_info.rank,
                 world_size=config.tp_info.size,
                 timeout=timedelta(seconds=config.distributed_timeout),
                 init_method=config.distributed_addr,
             )
-            tp_cpu_group = torch.distributed.group.WORLD
+            tp_cpu_group = dist.group.WORLD
             assert tp_cpu_group is not None
             max_bytes = (
                 config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
-            torch.distributed.init_process_group(
+            dist.init_process_group(
                 backend="nccl",
                 rank=config.tp_info.rank,
                 world_size=config.tp_info.size,
                 timeout=timedelta(seconds=config.distributed_timeout),
                 init_method=config.distributed_addr,
             )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
+            tp_cpu_group = dist.new_group(backend="gloo")
             assert tp_cpu_group is not None
         return tp_cpu_group
 
@@ -1132,6 +1152,9 @@ class Engine:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
+        if self.config.tp_info.size == 1:
+            return free_memory, free_memory
+
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
             free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
@@ -1438,7 +1461,8 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
-        torch.distributed.destroy_process_group()
+        if self.tp_cpu_group is not None:
+            torch.distributed.destroy_process_group()
         destroy_distributed()
 
 

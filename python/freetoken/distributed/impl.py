@@ -64,9 +64,17 @@ class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        from .info import get_tp_info
+
+        if get_tp_info().size == 1:
+            return x
         return self.plugins[-1].all_reduce(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        from .info import get_tp_info
+
+        if get_tp_info().size == 1:
+            return x
         return self.plugins[-1].all_gather(x)
 
 

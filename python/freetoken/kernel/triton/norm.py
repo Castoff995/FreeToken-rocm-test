@@ -30,7 +30,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
-from freetoken.utils.arch import is_sm90_supported
+from freetoken.utils.arch import is_sm90_supported, triton_pdl_launch_kwargs
 
 _HEUR = {"BLOCK": lambda a: triton.next_power_of_2(a["H"])}
 
@@ -144,8 +144,9 @@ def _rmsnorm(input, weight, eps, out, gemma: bool):
     pdl = contig and is_sm90_supported()
     _rmsnorm_kernel[(A, B)](
         out, input, weight, eps, H, sxa, sxb, soa, sob,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
+        CONTIG=contig, ENABLE_PDL=pdl, GEMMA=gemma,
         num_warps=_num_warps(A * B), num_stages=1,
+        **triton_pdl_launch_kwargs(pdl),
     )
     return out
 
@@ -172,8 +173,9 @@ def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
     pdl = contig and is_sm90_supported()
     _fused_add_rmsnorm_kernel[(A, B)](
         input, residual, weight, eps, H, sxa, sxb, sra, srb,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
+        CONTIG=contig, ENABLE_PDL=pdl, GEMMA=gemma,
         num_warps=_num_warps(A * B), num_stages=1,
+        **triton_pdl_launch_kwargs(pdl),
     )
 
 

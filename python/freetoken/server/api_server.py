@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-if sys.platform == 'win32':
-    # patched: zmq.asyncio requires a Selector loop; Windows defaults to Proactor
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import contextlib
 import json
 import os
@@ -48,6 +44,7 @@ from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
 from .request_logger import init as init_request_logging, log_request
 from .responses_api import register_responses_routes
+from .loop import uvicorn_loop_factory
 from .stats import StatsTracker
 
 logger = init_logger(__name__, "FrontendAPI")
@@ -899,7 +896,15 @@ def _serve_and_run_shell(host: str, port: int) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            access_log=False,
+            loop=uvicorn_loop_factory,
+        )
+    )
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -1038,4 +1043,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, loop=uvicorn_loop_factory)

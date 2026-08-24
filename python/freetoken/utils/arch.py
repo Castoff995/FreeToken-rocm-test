@@ -46,3 +46,18 @@ def is_sm90_supported() -> bool:
 
 def is_sm100_supported() -> bool:
     return is_arch_supported(10, 0)
+
+
+def triton_pdl_launch_kwargs(enabled: bool) -> dict[str, bool]:
+    """Return the NVIDIA-only Triton PDL launch option when supported by the backend.
+
+    Triton's AMD backend does not implement PDL, and Windows wheels may reject the
+    keyword even when it is false.  Omitting it on ROCm keeps AMD launches portable;
+    CUDA/NVIDIA receives the exact historical keyword and value.
+    """
+
+    import torch
+
+    if getattr(torch.version, "hip", None):
+        return {}
+    return {"launch_pdl": enabled}
