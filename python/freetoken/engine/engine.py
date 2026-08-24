@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import sys
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -67,6 +68,104 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     what the resident model consumed. Kept as a pure function so the composition with the
     pool families' ``solve_num_pages`` stays CPU-testable."""
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+
+
+def _raise_pre_kv_diagnostic_failure(stage: str, exc: BaseException) -> None:
+    message = (
+        f"ROCm pre-KV diagnostic: {stage}=FAIL "
+        f"type={type(exc).__name__} message={exc}"
+    )
+    logger.warning_rank0(message)
+    raise RuntimeError(message) from exc
+
+
+def _run_windows_rocm_pre_kv_diagnostic(device: torch.device) -> dict[str, object] | None:
+    """Temporary same-thread diagnostics immediately before the startup KV allocation."""
+
+    if sys.platform != "win32" or not getattr(torch.version, "hip", None):
+        return None
+
+    state: dict[str, object] = {
+        "cuda_available": bool(torch.cuda.is_available()),
+        "device": str(device),
+    }
+    logger.info_rank0(
+        "ROCm pre-KV diagnostic: "
+        f"cuda_available={state['cuda_available']} device={state['device']}"
+    )
+    if not state["cuda_available"]:
+        _raise_pre_kv_diagnostic_failure(
+            "cuda_available", RuntimeError("torch.cuda.is_available() is false")
+        )
+
+    try:
+        current_before = int(torch.cuda.current_device())
+        device_name = str(torch.cuda.get_device_name(current_before))
+    except Exception as exc:
+        _raise_pre_kv_diagnostic_failure("device_state_before", exc)
+    state["current_device_before"] = current_before
+    state["device_name"] = device_name
+    logger.info_rank0(
+        "ROCm pre-KV diagnostic: "
+        f"current_device_before={current_before} device_name={device_name}"
+    )
+
+    try:
+        from freetoken.kernel.pinned import _load_hip_runtime
+
+        runtime = _load_hip_runtime()
+        if runtime is None:
+            raise RuntimeError("HIP runtime is unavailable")
+        hip_status = int(runtime.hipGetLastError())
+    except Exception as exc:
+        _raise_pre_kv_diagnostic_failure("hip_last_error_before_clear", exc)
+    state["hip_last_error_before_clear"] = hip_status
+    logger.info_rank0(
+        f"ROCm pre-KV diagnostic: hip_last_error_before_clear={hip_status}"
+    )
+
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        free_bytes, total_bytes = int(free_bytes), int(total_bytes)
+    except Exception as exc:
+        _raise_pre_kv_diagnostic_failure("mem_get_info", exc)
+    state["memory_free_bytes"] = free_bytes
+    state["memory_total_bytes"] = total_bytes
+    logger.info_rank0(
+        "ROCm pre-KV diagnostic: mem_get_info=ok "
+        f"free_bytes={free_bytes} total_bytes={total_bytes} "
+        f"free_GiB={free_bytes / 2**30:.3f} total_GiB={total_bytes / 2**30:.3f}"
+    )
+
+    probes = (("probe_1byte", 1), ("probe_1MiB", 1 << 20))
+    for stage, size in probes:
+        probe = None
+        try:
+            probe = torch.empty(size, dtype=torch.uint8, device=device)
+            torch.cuda.synchronize(device)
+        except Exception as exc:
+            _raise_pre_kv_diagnostic_failure(stage, exc)
+        finally:
+            del probe
+        state[stage] = "ok"
+        logger.info_rank0(f"ROCm pre-KV diagnostic: {stage}=ok")
+
+    try:
+        torch.cuda.empty_cache()
+    except Exception as exc:
+        _raise_pre_kv_diagnostic_failure("empty_cache", exc)
+    state["empty_cache"] = "ok"
+    logger.info_rank0("ROCm pre-KV diagnostic: empty_cache=ok")
+
+    try:
+        current_after = int(torch.cuda.current_device())
+    except Exception as exc:
+        _raise_pre_kv_diagnostic_failure("current_device_after_probes", exc)
+    state["current_device_after"] = current_after
+    logger.info_rank0(
+        f"ROCm pre-KV diagnostic: current_device_after_probes={current_after}"
+    )
+    return state
 
 
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
@@ -344,6 +443,7 @@ class Engine:
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
+        _run_windows_rocm_pre_kv_diagnostic(self.device)
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
