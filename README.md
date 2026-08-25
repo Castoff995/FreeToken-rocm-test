@@ -89,6 +89,25 @@ Validated custom Windows ROCm build on AMD Radeon RX 9070 XT (`gfx1201`):
 
 This is a custom Windows ROCm/gfx1201 build validated on one RX 9070 XT system; it is not official FlashML or AMD support.
 
+### llama.cpp comparison
+
+The same Qwen3.6-35B-A3B-NVFP4 checkpoint was also validated with
+llama.cpp b10566 on ROCm 7.14.
+
+The default Windows gfx1201 hipBLASLt path hits an upstream ROCm bug.
+With:
+
+`ROCBLAS_USE_HIPBLASLT=0`
+
+llama.cpp completes end-to-end inference successfully.
+
+- llama.cpp median decode: **15.918 tok/s**
+- Custom FreeToken median decode: **13.920 tok/s**
+- Difference in this test: **+14.353% llama.cpp**
+- HIP fatal / TDR / reset: **NO / NO / NO**
+
+This is a configuration-specific comparison, not a general engine benchmark.
+
 ### Measured performance (RX 9070 XT, Windows, stock settings)
 
 | Model | Precision | Fit | Decode speed | Notes |
