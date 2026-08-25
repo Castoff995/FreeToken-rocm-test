@@ -286,14 +286,20 @@ PERFORMANCE_WINNER=LLAMA_CPP
 HIP_FATAL=NO
 TDR=NO
 DRIVER_RESET=NO
+```
+
 For this specific Qwen3.6 model, RX 9070 XT, Windows, and tested software
-configuration, llama.cpp with ROCBLAS_USE_HIPBLASLT=0 achieved approximately
+configuration, llama.cpp with `ROCBLAS_USE_HIPBLASLT=0` achieved approximately
 14.35% higher median decode throughput than the validated custom FreeToken
 12 GiB configuration.
+
 This is not a general engine-level performance conclusion.
+
 The default ROCm 7.14 hipBLASLt routing path on Windows/gfx1201 remains affected
 by an upstream sequence/state-dependent GEMM bug. The llama.cpp result above
-therefore depends on the ROCBLAS_USE_HIPBLASLT=0 workaround.
+therefore depends on the `ROCBLAS_USE_HIPBLASLT=0` workaround.
+
 Relevant upstream tracking:
+
 - llama.cpp: https://github.com/ggml-org/llama.cpp/issues/27670
 - ROCm: https://github.com/ROCm/legacy-rocm-build/issues/6461
