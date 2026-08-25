@@ -32,6 +32,16 @@ P0_PRS = (132, 133, 134, 135, 136, 137)
 TRACKED_ISSUES = (79, 82, 110, 111, 120, 122, 123, 124)
 P0_ISSUES = (79, 82, 120, 122)
 
+EXTERNAL_TRACKED_ISSUES = {
+    "ROCm/legacy-rocm-build": (6461,),
+}
+
+HIGH_RELEVANCE_EXTERNAL_ISSUES = {
+    "ROCm/legacy-rocm-build#6461": (
+        "Windows + gfx1201 + hipBLASLt/rocBLAS sequence/state-dependent GEMM failure"
+    ),
+}
+
 BRANCHES = {
     "FlashML-org/FreeToken:main": ("FlashML-org/FreeToken", "main"),
     "PialGhosh2233/FreeToken-rocm-gfx1200:gfx1200-moe-gguf": (
@@ -51,6 +61,16 @@ RELEASE_REPOS = (
 )
 
 DEPENDENCY_SEARCHES = {
+    "ROCm/legacy-rocm-build": (
+        "gfx1201",
+        "RDNA4 Windows",
+        "hipBLASLt",
+        "rocBLAS",
+        "hipErrorInvalidValue",
+        "ROCBLAS_USE_HIPBLASLT",
+        "BF16 GEMM",
+        "invalid argument",
+    ),
     "ROCm/TheRock": (
         "gfx1201",
         "RDNA4 Windows",
@@ -260,6 +280,7 @@ class Collector:
             "version": STATE_VERSION,
             "tracked_prs": {},
             "tracked_issues": {},
+            "external_tracked_issues": {},
             "discovered": {},
             "branches": {},
             "releases": {},
@@ -282,6 +303,9 @@ class Collector:
             )
             if value is not None:
                 state["tracked_issues"][str(number)] = value
+
+        external_items = self.collect_external_tracked_issues()
+        state["external_tracked_issues"].update(external_items)
 
         upstream_items = self.guarded(
             "upstream discovery",
@@ -394,6 +418,23 @@ class Collector:
             raise RuntimeError("unexpected issue response")
         return normalize_issue_item(repo, issue)
 
+    def collect_external_tracked_issues(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for repo, numbers in EXTERNAL_TRACKED_ISSUES.items():
+            for number in numbers:
+                key = f"{repo}#{number}"
+                value = self.guarded(
+                    f"external issue {key}",
+                    lambda r=repo, n=number: self.collect_issue(r, n),
+                )
+                if value is None:
+                    continue
+                if key in HIGH_RELEVANCE_EXTERNAL_ISSUES:
+                    value["relevance"] = "high"
+                    value["relevance_reason"] = HIGH_RELEVANCE_EXTERNAL_ISSUES[key]
+                out[key] = value
+        return out
+
     def collect_upstream_discovery(self) -> dict[str, Any]:
         items = self.client.get(
             f"/repos/{UPSTREAM_REPO}/issues?state=all&sort=updated&direction=desc&per_page=100"
@@ -431,6 +472,8 @@ class Collector:
                         continue
                     number = int(item.get("number") or 0)
                     key = f"{repo}#{number}"
+                    if is_explicitly_tracked_external_issue(key):
+                        continue
                     out[key] = normalize_issue_item(repo, item)
         ordered = sorted(
             out.items(),
@@ -525,6 +568,21 @@ def dependency_item_relevant(repo: str, item: dict[str, Any], term: str) -> bool
     needle = term.lower().strip('"')
     if needle in text:
         return True
+    if repo == "ROCm/legacy-rocm-build":
+        return any(
+            x in text
+            for x in (
+                "gfx1201",
+                "rdna4",
+                "windows",
+                "hipblaslt",
+                "rocblas",
+                "hiperrorinvalidvalue",
+                "invalid argument",
+                "bf16",
+                "gemm",
+            )
+        )
     if repo == "pytorch/pytorch":
         return "gfx1201" in text or ("windows" in text and "rocm" in text)
     if repo == "ROCm/TheRock":
@@ -536,11 +594,24 @@ def dependency_item_relevant(repo: str, item: dict[str, Any], term: str) -> bool
     return False
 
 
+def is_explicitly_tracked_external_issue(key: str) -> bool:
+    repo, separator, number_text = key.rpartition("#")
+    if not separator or not number_text.isdigit():
+        return False
+    return int(number_text) in EXTERNAL_TRACKED_ISSUES.get(repo, ())
+
+
 def merge_missing_from_old(current: dict[str, Any], old: dict[str, Any]) -> dict[str, Any]:
     """Do not interpret transient API failures as tracked-item deletions."""
     if not old:
         return current
-    for section in ("tracked_prs", "tracked_issues", "branches", "releases"):
+    for section in (
+        "tracked_prs",
+        "tracked_issues",
+        "external_tracked_issues",
+        "branches",
+        "releases",
+    ):
         old_section = old.get(section, {})
         cur_section = current.setdefault(section, {})
         if isinstance(old_section, dict) and isinstance(cur_section, dict):
@@ -672,6 +743,31 @@ def diff_states(
             fields_changed.append("body edited")
         if fields_changed:
             changes.append(f"{link}: " + ", ".join(fields_changed) + ".")
+
+    old_external_issues = old.get("external_tracked_issues", {})
+    new_external_issues = new.get("external_tracked_issues", {})
+    for key, cur in sorted(new_external_issues.items()):
+        prev = old_external_issues.get(key)
+        link = item_link(cur, key)
+        relevance = " **High relevance.**" if cur.get("relevance") == "high" else ""
+        if prev is None:
+            changes.append(f"**Новый явно отслеживаемый external issue:** {link}.{relevance}")
+            continue
+        fields_changed = []
+        if prev.get("state") != cur.get("state"):
+            fields_changed.append(f"state {prev.get('state')}→{cur.get('state')}")
+        if prev.get("comments") != cur.get("comments"):
+            fields_changed.append(f"comments {prev.get('comments', 0)}→{cur.get('comments', 0)}")
+        if prev.get("body_hash") != cur.get("body_hash"):
+            fields_changed.append("body edited")
+        if prev.get("updated_at") != cur.get("updated_at"):
+            fields_changed.append(
+                f"updated_at {prev.get('updated_at')}→{cur.get('updated_at')}"
+            )
+        if prev.get("title") != cur.get("title"):
+            fields_changed.append("title changed")
+        if fields_changed:
+            changes.append(f"{link}: " + ", ".join(fields_changed) + f".{relevance}")
 
     old_items = old.get("discovered", {})
     new_items = new.get("discovered", {})
